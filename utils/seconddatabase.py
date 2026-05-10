@@ -1,0 +1,402 @@
+import aiomysql
+import asyncio
+import time
+from datetime import datetime
+from typing import Optional, Union, List, Dict, Any, Tuple
+from config import DB_CONFIG
+
+class ConnectionMetrics:
+    """Class to track database connection metrics"""
+    def __init__(self):
+        self.active_connections = 0
+        self.peak_connections = 0
+        self.connection_errors = 0
+        self.query_times = []
+        self.max_query_times = 100  # Store last 100 query times
+        self.last_error = None
+        self.last_error_time = None
+        self.total_queries = 0
+        self.slow_queries = 0
+        self.slow_query_threshold = 100  # ms
+    
+    def record_connection_acquired(self):
+        self.active_connections += 1
+        self.peak_connections = max(self.peak_connections, self.active_connections)
+    
+    def record_connection_released(self):
+        self.active_connections = max(0, self.active_connections - 1)
+    
+    def record_query_time(self, time_ms):
+        self.total_queries += 1
+        if time_ms > self.slow_query_threshold:
+            self.slow_queries += 1
+            
+        if len(self.query_times) >= self.max_query_times:
+            self.query_times.pop(0)
+        self.query_times.append(time_ms)
+    
+    def record_error(self, error):
+        self.connection_errors += 1
+        self.last_error = str(error)
+        self.last_error_time = datetime.now()
+    
+    def get_avg_query_time(self):
+        if not self.query_times:
+            return 0
+        return sum(self.query_times) / len(self.query_times)
+    
+    def get_metrics_report(self):
+        return {
+            "active_connections": self.active_connections,
+            "peak_connections": self.peak_connections,
+            "connection_errors": self.connection_errors,
+            "avg_query_time": self.get_avg_query_time(),
+            "total_queries": self.total_queries,
+            "slow_queries": self.slow_queries,
+            "slow_query_percentage": (self.slow_queries / self.total_queries * 100) if self.total_queries > 0 else 0,
+            "last_error": self.last_error,
+            "last_error_time": self.last_error_time
+        }
+
+class DatabaseManager:
+    """Singleton class to manage database connections and operations"""
+    _instance = None
+    _pool_initialized = asyncio.Event()  # Event to track pool initialization
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(DatabaseManager, cls).__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+    
+    def __init__(self):
+        if self._initialized:
+            return
+            
+        self._pool = None
+        self.metrics = ConnectionMetrics()
+        self._keep_alive_task = None
+        self._initialized = True
+        self._connection_retry_attempts = 3
+        self._connection_retry_delay = 2  # seconds
+        self._pool_init_lock = asyncio.Lock()  # Lock to prevent multiple initialization attempts
+        self._warm_connections = []  # Keep a few warm connections ready
+        
+        # Start the pool initialization immediately
+        asyncio.create_task(self._initialize_pool())
+    
+    async def _initialize_pool(self):
+        """Initialize the connection pool"""
+        # Use a lock to prevent multiple concurrent initialization attempts
+        async with self._pool_init_lock:
+            if self._pool is not None and not self._pool._closed:
+                self._pool_initialized.set()
+                return
+                
+            try:
+                start_time = time.time()
+                print("Creating database pool...")
+                
+                self._pool = await aiomysql.create_pool(
+                    host=DB_CONFIG['host'],
+                    port=DB_CONFIG['port'],
+                    user=DB_CONFIG['user'],
+                    password=DB_CONFIG['password'],
+                    db=DB_CONFIG['database'],
+                    autocommit=True,
+                    minsize=50,              # Initial idle connections
+                    maxsize=100,              # Limit total active connections
+                    pool_recycle=1200,       # Recycle connections every 1200 seconds
+                    echo=False,              # Disable debug logging
+                    connect_timeout=5        # Reduce connection timeout for faster startup
+                )
+                
+                init_time = time.time() - start_time
+                print(f"Database pool created successfully in {init_time:.2f}s")
+                
+                # Signal that the pool is initialized
+                self._pool_initialized.set()
+                
+                # Pre-warm some connections
+                await self._prewarm_connections()
+                
+                # Start the keep-alive task
+                if self._keep_alive_task is None or self._keep_alive_task.done():
+                    self._keep_alive_task = asyncio.create_task(self._keep_pool_alive())
+                    
+            except Exception as e:
+                self.metrics.record_error(e)
+                print(f"Error creating connection pool: {e}")
+                # Clear the event in case of failure
+                self._pool_initialized.clear()
+                
+                # Retry initialization after a delay
+                asyncio.create_task(self._delayed_retry_init())
+    
+    async def _delayed_retry_init(self):
+        """Retry pool initialization after a delay"""
+        await asyncio.sleep(5)  # Wait 5 seconds before retrying
+        await self._initialize_pool()
+    
+    async def _prewarm_connections(self):
+        """Pre-warm some connections to improve first-time performance"""
+        try:
+            # Create a few warm connections
+            warm_count = min(5, self._pool.maxsize // 2)  # Use up to half of max connections, but no more than 5
+            
+            print(f"Pre-warming {warm_count} database connections...")
+            start_time = time.time()
+            
+            # Get connections in parallel
+            tasks = [self._warm_single_connection() for _ in range(warm_count)]
+            self._warm_connections = await asyncio.gather(*tasks)
+            
+            warm_time = time.time() - start_time
+            print(f"Pre-warmed {len(self._warm_connections)} connections in {warm_time:.2f}s")
+            
+        except Exception as e:
+            print(f"Error pre-warming connections: {e}")
+    
+    async def _warm_single_connection(self):
+        """Get and warm up a single connection"""
+        conn = await self._pool.acquire()
+        self.metrics.record_connection_acquired()
+        
+        # Execute a simple query to ensure the connection is fully established
+        async with conn.cursor() as cursor:
+            await cursor.execute("SELECT 1")
+            await cursor.fetchall()
+        
+        return conn
+    
+    async def _keep_pool_alive(self):
+        """Keep the connection pool alive with periodic queries"""
+        while True:
+            try:
+                if self._pool and not self._pool._closed:
+                    # Execute a simple query to keep connections warm
+                    await self.execute_query("SELECT 1")
+                    
+                    # Release and re-acquire warm connections periodically to prevent them from going stale
+                    if self._warm_connections:
+                        # Release one warm connection
+                        conn = self._warm_connections.pop(0)
+                        self._pool.release(conn)
+                        self.metrics.record_connection_released()
+                        
+                        # Acquire a new one
+                        new_conn = await self._warm_single_connection()
+                        self._warm_connections.append(new_conn)
+                else:
+                    # If pool is closed, try to reinitialize it
+                    self._pool_initialized.clear()
+                    await self._initialize_pool()
+            except Exception as e:
+                print(f"Error in keep_pool_alive: {e}")
+                
+            # Wait before next check
+            await asyncio.sleep(60)  # Check every minute
+    
+    async def get_connection(self):
+        """Get a connection from the pool"""
+        # Wait for pool to be initialized if it's not ready
+        if not self._pool_initialized.is_set():
+            try:
+                # Wait with timeout to avoid hanging indefinitely
+                await asyncio.wait_for(self._pool_initialized.wait(), timeout=10)
+            except asyncio.TimeoutError:
+                print("Timeout waiting for database pool initialization")
+                # Try to initialize the pool again
+                asyncio.create_task(self._initialize_pool())
+                return None
+        
+        # Check if pool exists and is not closed
+        if self._pool is None or self._pool._closed:
+            self._pool_initialized.clear()
+            asyncio.create_task(self._initialize_pool())
+            return None
+        
+        # Try to use a pre-warmed connection if available
+        if self._warm_connections:
+            conn = self._warm_connections.pop(0)
+            return conn
+            
+        # Otherwise get a new connection from the pool
+        try:
+            conn = await self._pool.acquire()
+            self.metrics.record_connection_acquired()
+            return conn
+        except Exception as e:
+            self.metrics.record_error(e)
+            print(f"Error acquiring connection: {e}")
+            return None
+    
+    async def release_connection(self, conn):
+        """Release a connection back to the pool"""
+        if conn and self._pool and not self._pool._closed:
+            # If we have fewer than our target warm connections, keep this one warm
+            if len(self._warm_connections) < 5 and len(self._warm_connections) < self._pool.maxsize // 2:
+                self._warm_connections.append(conn)
+            else:
+                self._pool.release(conn)
+                self.metrics.record_connection_released()
+    
+    async def execute_query(self, query: str, params: Optional[tuple] = None) -> Union[List[Dict[str, Any]], None]:
+        """Execute a query and return the results"""
+        conn = None
+        start_time = time.time()
+        
+        try:
+            conn = await self.get_connection()
+            if not conn:
+                return None
+                
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(query, params)
+                result = await cursor.fetchall()
+                
+                # Record query time in milliseconds
+                query_time = (time.time() - start_time) * 1000
+                self.metrics.record_query_time(query_time)
+                
+                # Log slow queries
+                if query_time > self.metrics.slow_query_threshold:
+                    print(f"Slow query ({query_time:.2f}ms): {query[:100]}...")
+                
+                return result
+        except Exception as e:
+            self.metrics.record_error(e)
+            print(f"Error executing query: {e}")
+            return None
+        finally:
+            if conn:
+                await self.release_connection(conn)
+    
+    async def execute_query_with_retry(self, query: str, params: Optional[tuple] = None, max_retries: int = 3) -> Union[List[Dict[str, Any]], None]:
+        """Execute a query with automatic retry on failure"""
+        # If this is the first query and pool isn't initialized yet, wait for it
+        if not self._pool_initialized.is_set():
+            try:
+                # Use a shorter timeout for the first query to improve responsiveness
+                await asyncio.wait_for(self._pool_initialized.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                print("Timeout waiting for database pool initialization during query")
+                # Continue anyway - the get_connection method will handle this
+        
+        for attempt in range(max_retries):
+            try:
+                result = await self.execute_query(query, params)
+                if result is not None:  # None indicates an error
+                    return result
+                    
+                # If we got None, wait and retry
+                retry_delay = self._connection_retry_delay * (2 ** attempt)  # Exponential backoff
+                print(f"Query attempt {attempt+1} failed. Retrying in {retry_delay}s...")
+                await asyncio.sleep(retry_delay)
+            except Exception as e:
+                print(f"Retry attempt {attempt+1} failed with error: {e}")
+                if attempt == max_retries - 1:  # Last attempt
+                    raise  # Re-raise the exception if all retries failed
+                await asyncio.sleep(self._connection_retry_delay * (2 ** attempt))
+                
+        return None  # All retries failed
+    
+    async def execute_transaction(self, queries: List[Tuple[str, Optional[tuple]]]) -> bool:
+        """Execute multiple queries as a transaction"""
+        conn = None
+        
+        try:
+            conn = await self.get_connection()
+            if not conn:
+                return False
+                
+            # Disable autocommit for transaction
+            await conn.begin()
+            
+            async with conn.cursor() as cursor:
+                for query, params in queries:
+                    await cursor.execute(query, params)
+                
+                # Commit the transaction
+                await conn.commit()
+                return True
+        except Exception as e:
+            # Rollback on error
+            if conn:
+                await conn.rollback()
+            self.metrics.record_error(e)
+            print(f"Transaction error: {e}")
+            return False
+        finally:
+            if conn:
+                await self.release_connection(conn)
+    
+    async def close(self):
+        """Close the connection pool"""
+        # Release all warm connections
+        for conn in self._warm_connections:
+            if self._pool and not self._pool._closed:
+                self._pool.release(conn)
+                self.metrics.record_connection_released()
+        self._warm_connections = []
+        
+        if self._pool:
+            self._pool.close()
+            await self._pool.wait_closed()
+            self._pool = None
+            print("Database pool closed")
+            
+            # Clear the initialized event
+            self._pool_initialized.clear()
+            
+            # Cancel the keep-alive task
+            if self._keep_alive_task and not self._keep_alive_task.done():
+                self._keep_alive_task.cancel()
+                try:
+                    await self._keep_alive_task
+                except asyncio.CancelledError:
+                    pass
+    
+    def get_metrics(self):
+        """Get current database metrics"""
+        metrics = self.metrics.get_metrics_report()
+        
+        # Add warm connection count to metrics
+        metrics["warm_connections"] = len(self._warm_connections)
+        
+        # Add pool status
+        if self._pool:
+            metrics["pool_size"] = self._pool.size
+            metrics["pool_free"] = self._pool.freesize
+            metrics["pool_initialized"] = self._pool_initialized.is_set()
+        else:
+            metrics["pool_size"] = 0
+            metrics["pool_free"] = 0
+            metrics["pool_initialized"] = False
+            
+        return metrics
+
+# Create a singleton instance
+db = DatabaseManager()
+
+# Export functions for backward compatibility
+async def execute_query(query: str, params: Optional[tuple] = None) -> Union[List[Dict[str, Any]], None]:
+    return await db.execute_query(query, params)
+
+async def execute_query_with_retry(query: str, params: Optional[tuple] = None, max_retries: int = 3) -> Union[List[Dict[str, Any]], None]:
+    return await db.execute_query_with_retry(query, params, max_retries)
+
+async def execute_transaction(queries: List[Tuple[str, Optional[tuple]]]) -> bool:
+    return await db.execute_transaction(queries)
+
+async def get_connection():
+    return await db.get_connection()
+
+async def release_connection(conn):
+    await db.release_connection(conn)
+
+async def close_pool():
+    await db.close()
+
+def get_metrics():
+    return db.get_metrics()

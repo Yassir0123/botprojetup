@@ -1,0 +1,511 @@
+import discord
+from discord.ext import commands
+import mysql.connector
+from mysql.connector import Error
+import random
+from utils.database import create_db_connection
+import aiomysql
+import time
+import urllib
+class SpawnCommands(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+        self.db_pool = None
+
+    async def create_db_pool(self):
+        try:
+            self.db_pool = await aiomysql.create_pool(
+                host='localhost',
+                user='root',
+                password='',
+                db='sololevelingbot',
+                autocommit=True
+            )
+        except Exception as e:
+            print(f"Error creating database pool: {e}")
+
+
+    async def execute_query(self, query, params=None):
+        if not self.db_pool:
+            await self.create_db_pool()
+        
+        start_time = time.time()
+        async with self.db_pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                try:
+                    await cursor.execute(query, params)
+                    result = await cursor.fetchall()
+                    print(f"Query execution time: {time.time() - start_time:.2f} seconds")
+                    return result
+                except Error as e:
+                    print(f"Error executing query: {e}")
+                    return None
+    @commands.command()
+    async def viewmycard(self, ctx, *, card_name):
+        try:
+            user_query = "SELECT user_id FROM user WHERE user_authorid = %s"
+            user_result = await self.execute_query(user_query, (str(ctx.author.id),))
+
+            if not user_result:
+                await ctx.send("Error: You need to register to the bot first.")
+                return
+
+            user_id = user_result[0]['user_id']
+
+            card_query = """
+            SELECT uc.*, c.card_name, c.image, c.xp_cap, c.max_level, c.type_card, 
+                   cr.cardrank_name, w.weapon_name
+            FROM user_cards uc
+            JOIN card c ON uc.card_id = c.card_id
+            JOIN card_rank cr ON c.card_rank = cr.cardrank_id
+            LEFT JOIN weapon w ON uc.weapon_id = w.weapon_id
+            WHERE uc.user_id = %s AND c.card_name = %s
+            """
+            card_result = await self.execute_query(card_query, (user_id, card_name))
+
+            if not card_result:
+                await ctx.send(f"You don't have a card named '{card_name}' in your collection.")
+                return
+
+            card = card_result[0]
+            embed = discord.Embed(
+                title=f"Your Card: {card['card_name']}",
+                description=(
+                    f"*✨ Rank*: {card['cardrank_name']}\n"
+                    f"*🔮 Type*: {card['type_card']}\n"
+                    f"*🌟 Level*: {card['current_level']}/{card['max_level']}\n"
+                    f"*📊 XP*: {card['current_xp']}/{card['xp_cap']}\n"
+                    f"*🗡️ Weapon*: {card['weapon_name'] or 'None'}\n\n"
+                    f"*⚔️ Power*: {card['power_stat']}\n"
+                    f"*🛡️ Health*: {card['health_stat']}\n"
+                    f"*💨 Speed*: {card['speed_stat']}\n"
+                    f"*🔥 Attack*: {card['attack_stat']}\n"
+                ),
+                color=discord.Color.blue()
+            )
+            embed.set_image(url=card['image'])
+            await ctx.send(embed=embed)
+
+        except Exception as e:
+            print(f"Error: {e}")
+            await ctx.send("An error occurred while processing your request.")
+
+    @commands.command()
+    async def viewthiscard(self, ctx, *, card_name):
+        try:
+            user_query = "SELECT user_id FROM user WHERE user_authorid = %s"
+            user_result = await self.execute_query(user_query, (str(ctx.author.id),))
+
+            if not user_result:
+                await ctx.send("Error: You need to register to the bot first.")
+                return
+
+            card_query = """
+            SELECT c.*, cr.cardrank_name
+            FROM card c
+            JOIN card_rank cr ON c.card_rank = cr.cardrank_id
+            WHERE c.card_name = %s
+            """
+            card_result = await self.execute_query(card_query, (card_name,))
+
+            if not card_result:
+                await ctx.send(f"No card named '{card_name}' found in the database.")
+                return
+
+            card = card_result[0]
+            embed = discord.Embed(
+                title=f"Card: {card['card_name']}",
+                description=(
+                    f"*✨ Rank*: {card['cardrank_name']}\n"
+                    f"*🔮 Type*: {card['type_card']}\n"
+                    f"*⚔️ Power*: {card['power']}\n"
+                    f"*🛡️ Health*: {card['health']}\n"
+                    f"*💨 Speed*: {card['speed']}\n"
+                    f"*🔥 Attack*: {card['attack']}\n\n"
+                    f"*📜 Description*: {card['description']}"
+                ),
+                color=discord.Color.green()
+            )
+            embed.set_image(url=card['image'])
+            await ctx.send(embed=embed)
+
+        except Exception as e:
+            print(f"Error: {e}")
+            await ctx.send("An error occurred while processing your request.")
+
+    @commands.command()
+    async def viewmycards(self, ctx):
+        try:
+            user_query = "SELECT user_id FROM user WHERE user_authorid = %s"
+            user_result = await self.execute_query(user_query, (str(ctx.author.id),))
+
+            if not user_result:
+                await ctx.send("Error: You need to register to the bot first.")
+                return
+
+            user_id = user_result[0]['user_id']
+
+            cards_query = """
+            SELECT uc.*, c.card_name, c.image, c.xp_cap, c.max_level, c.type_card, 
+                   cr.cardrank_name, w.weapon_name
+            FROM user_cards uc
+            JOIN card c ON uc.card_id = c.card_id
+            JOIN card_rank cr ON c.card_rank = cr.cardrank_id
+            LEFT JOIN weapon w ON uc.weapon_id = w.weapon_id
+            WHERE uc.user_id = %s
+            ORDER BY FIELD(cr.cardrank_name, 'S', 'A', 'B', 'C', 'D', 'E')
+            """
+            cards = await self.execute_query(cards_query, (user_id,))
+            if not cards:
+                await ctx.send("You don't have any cards yet.")
+                return
+
+            pages = []
+            for i, card in enumerate(cards):
+                embed = discord.Embed(
+                    title=f"Your Card: {card['card_name']}",
+                    description=(
+                        f"*✨ Rank*: {card['cardrank_name']}\n"
+                        f"*🔮 Type*: {card['type_card']}\n"
+                        f"*🌟 Level*: {card['current_level']}/{card['max_level']}\n"
+                        f"*📊 XP*: {card['current_xp']}/{card['xp_cap']}\n"
+                        f"*🗡️ Weapon*: {card['weapon_name'] or 'None'}\n\n"
+                        f"*⚔️ Power*: {card['power_stat']}\n"
+                        f"*🛡️ Health*: {card['health_stat']}\n"
+                        f"*💨 Speed*: {card['speed_stat']}\n"
+                        f"*🔥 Attack*: {card['attack_stat']}\n"
+                    ),
+                    color=discord.Color.blue()
+                )
+                embed.set_image(url=card['image'])
+                embed.set_footer(text=f"Card {i+1}/{len(cards)}")
+                pages.append(embed)
+
+            message = await ctx.send(embed=pages[0])
+            await message.add_reaction("⬅️")
+            await message.add_reaction("➡️")
+
+            def check(reaction, user):
+                return user == ctx.author and str(reaction.emoji) in ["⬅️", "➡️"]
+
+            current_page = 0
+            while True:
+                try:
+                    reaction, user = await self.bot.wait_for("reaction_add", timeout=60, check=check)
+
+                    if str(reaction.emoji) == "➡️" and current_page < len(pages) - 1:
+                        current_page += 1
+                        await message.edit(embed=pages[current_page])
+                        await message.remove_reaction(reaction, user)
+
+                    elif str(reaction.emoji) == "⬅️" and current_page > 0:
+                        current_page -= 1
+                        await message.edit(embed=pages[current_page])
+                        await message.remove_reaction(reaction, user)
+
+                    else:
+                        await message.remove_reaction(reaction, user)
+
+                except TimeoutError:
+                    break
+
+            await message.clear_reactions()
+
+        except Exception as e:
+            print(f"Error: {e}")
+            await ctx.send("An error occurred while processing your request.")
+
+    @commands.command()
+    async def viewallcards(self, ctx):
+        try:
+            user_query = "SELECT user_id FROM user WHERE user_authorid = %s"
+            user_result = await self.execute_query(user_query, (str(ctx.author.id),))
+
+            if not user_result:
+                await ctx.send("Error: You need to register to the bot first.")
+                return
+
+            cards_query = """
+            SELECT c.*, cr.cardrank_name
+            FROM card c
+            JOIN card_rank cr ON c.card_rank = cr.cardrank_id
+            ORDER BY FIELD(cr.cardrank_name, 'S', 'A', 'B', 'C', 'D', 'E')
+            """
+            cards = await self.execute_query(cards_query)
+
+            if not cards:
+                await ctx.send("There are no cards in the database.")
+                return
+
+            pages = []
+            for i, card in enumerate(cards):
+                embed = discord.Embed(
+                    title=f"Card: {card['card_name']}",
+                    description=(
+                        f"*✨ Rank*: {card['cardrank_name']}\n"
+                        f"*🔮 Type*: {card['type_card']}\n"
+                        f"*⚔️ Power*: {card['power']}\n"
+                        f"*🛡️ Health*: {card['health']}\n"
+                        f"*💨 Speed*: {card['speed']}\n"
+                        f"*🔥 Attack*: {card['attack']}\n\n"
+                        f"*📜 Description*: {card['description']}"
+                    ),
+                    color=discord.Color.green()
+                )
+                embed.set_image(url=card['image'])
+                embed.set_footer(text=f"Card {i+1}/{len(cards)}")
+                pages.append(embed)
+
+            message = await ctx.send(embed=pages[0])
+            await message.add_reaction("⬅️")
+            await message.add_reaction("➡️")
+
+            def check(reaction, user):
+                return user == ctx.author and str(reaction.emoji) in ["⬅️", "➡️"]
+
+            current_page = 0
+            while True:
+                try:
+                    reaction, user = await self.bot.wait_for("reaction_add", timeout=60, check=check)
+
+                    if str(reaction.emoji) == "➡️" and current_page < len(pages) - 1:
+                        current_page += 1
+                        await message.edit(embed=pages[current_page])
+                        await message.remove_reaction(reaction, user)
+
+                    elif str(reaction.emoji) == "⬅️" and current_page > 0:
+                        current_page -= 1
+                        await message.edit(embed=pages[current_page])
+                        await message.remove_reaction(reaction, user)
+
+                    else:
+                        await message.remove_reaction(reaction, user)
+
+                except TimeoutError:
+                    break
+
+            await message.clear_reactions()
+
+        except Exception as e:
+            print(f"Error: {e}")
+            await ctx.send("An error occurred while processing your request.")
+            
+    
+    def is_valid_url(self, url):
+        try:
+            result = urllib.parse.urlparse(url)
+            return all([result.scheme, result.netloc])
+        except ValueError:
+            return False
+
+    async def get_valid_card(self, cursor):
+        while True:
+            await cursor.execute("""
+                SELECT c.*, cr.cardrank_name 
+                FROM card c
+                JOIN card_rank cr ON c.card_rank = cr.cardrank_id
+                WHERE c.spawn_status = 1
+            """)
+            cards = await cursor.fetchall()
+
+            rank_order = {'S': 0, 'A': 1, 'B': 2, 'C': 3, 'D': 4, 'E': 5}
+            sorted_cards = sorted(cards, key=lambda x: rank_order[x['cardrank_name']])
+
+            rarity_percentages = {'S': 1, 'A': 2, 'B': 3, 'C': 6, 'D': 8, 'E': 80}
+
+            total = sum(rarity_percentages.values())
+            rand = random.randint(1, total)
+            current_sum = 0
+            selected_rank = None
+
+            for rank, percentage in rarity_percentages.items():
+                current_sum += percentage
+                if rand <= current_sum:
+                    selected_rank = rank
+                    break
+
+            possible_cards = [card for card in sorted_cards if card['cardrank_name'] == selected_rank]
+            drawn_card = random.choice(possible_cards)
+
+            if self.is_valid_url(drawn_card['image']):
+                return drawn_card
+
+    @commands.command()
+    async def spawn(self, ctx):
+        if not self.db_pool:
+            await self.create_db_pool()
+
+        if not self.db_pool:
+            await ctx.send("Unable to connect to the database. Please try again later.")
+            return
+
+        try:
+            async with self.db_pool.acquire() as conn:
+                async with conn.cursor(aiomysql.DictCursor) as cursor:
+                    # Get user information
+                    await cursor.execute("SELECT user_id, quantiter_fragment, fragment_cap FROM user WHERE user_authorid = %s", (str(ctx.author.id),))
+                    user_result = await cursor.fetchone()
+
+                    if not user_result:
+                        await ctx.send("Error: You need to register to the bot first.")
+                        return
+
+                    user_id = user_result['user_id']
+                    current_fragments = user_result['quantiter_fragment']
+                    fragment_cap = user_result['fragment_cap']
+
+                    # Get a valid card
+                    drawn_card = await self.get_valid_card(cursor)
+
+                    # Check if user already has the card
+                    await cursor.execute("SELECT * FROM user_cards WHERE user_id = %s AND card_id = %s", (user_id, drawn_card['card_id']))
+                    user_card_result = await cursor.fetchone()
+
+                    footer_text = ""
+                    if not user_card_result:
+                        # Add new card to user's collection
+                        await cursor.execute("""
+                            INSERT INTO user_cards (user_id, card_id, current_level, current_xp, 
+                            current_mana, power_stat, attack_stat, health_stat, speed_stat) 
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        """, (
+                            user_id, drawn_card['card_id'], drawn_card['min_level'], 0, 0,
+                            drawn_card['power'], drawn_card['attack'], drawn_card['health'], drawn_card['speed']
+                        ))
+                        title = f"🔥 New Card Unleashed: {drawn_card['card_name']}!"
+                        description = "🎉 Congratulations! This card has been added to your collection!"
+                    else:
+                        if current_fragments >= fragment_cap:
+                            title = f"Card Pulled: {drawn_card['card_name']}"
+                            description = "You've reached your fragment limit!"
+                            footer_text = "You have reached your fragments limits. Delete some if you wish to collect more!"
+                        else:
+                            # Handle fragment addition
+                            await cursor.execute("SELECT id_fragment FROM fragments WHERE card_id = %s", (drawn_card['card_id'],))
+                            fragment_result = await cursor.fetchone()
+
+                            if fragment_result:
+                                fragment_id = fragment_result['id_fragment']
+                                await cursor.execute("SELECT inventory_id FROM inventory WHERE user_id = %s", (user_id,))
+                                inventory_result = await cursor.fetchone()
+
+                                if inventory_result:
+                                    inventory_id = inventory_result['inventory_id']
+                                    await cursor.execute("SELECT * FROM inventory_frags WHERE inventory_id = %s AND frag_id = %s", (inventory_id, fragment_id))
+                                    inv_frag_result = await cursor.fetchone()
+
+                                    if inv_frag_result:
+                                        await cursor.execute("""
+                                            UPDATE inventory_frags 
+                                            SET quantiter = quantiter + 1 
+                                            WHERE inventory_id = %s AND frag_id = %s
+                                        """, (inventory_id, fragment_id))
+                                    else:
+                                        await cursor.execute("""
+                                            INSERT INTO inventory_frags (inventory_id, frag_id, quantiter)
+                                            VALUES (%s, %s, 1)
+                                        """, (inventory_id, fragment_id))
+
+                                    # Update total fragment count
+                                    await cursor.execute("""
+                                        SELECT SUM(quantiter) as total_fragments
+                                        FROM inventory_frags
+                                        WHERE inventory_id = %s
+                                    """, (inventory_id,))
+                                    total_fragments_result = await cursor.fetchone()
+                                    total_fragments = total_fragments_result['total_fragments']
+
+                                    if total_fragments <= fragment_cap:
+                                        await cursor.execute("""
+                                            UPDATE user
+                                            SET quantiter_fragment = %s
+                                            WHERE user_id = %s
+                                        """, (total_fragments, user_id))
+
+                                    title = f"Card Pulled: {drawn_card['card_name']}"
+                                    description = "You already have this card."
+                                    footer_text = f"You've received a fragment instead! Total fragments: {total_fragments}/{fragment_cap}"
+                                else:
+                                    title = f"Card Pulled: {drawn_card['card_name']}"
+                                    description = "Error: Inventory not found."
+                            else:
+                                title = f"Card Pulled: {drawn_card['card_name']}"
+                                description = "Error: Fragment not found for this card."
+
+                    embed = discord.Embed(
+                        title=title,
+                        description=(
+                            f"{description}\n\n"
+                            f"*✨ Rank*: {drawn_card['cardrank_name']}\n"
+                            f"*🔮 Type*: {drawn_card['type_card']}\n"
+                            f"*🌟 Level*: {drawn_card['min_level']}\n"
+                            f"*⚔️ Power*: {drawn_card['power']}\n"
+                            f"*🛡️ Defense*: {drawn_card['health']}\n"
+                            f"*💨 Speed*: {drawn_card['speed']}\n"
+                        ),
+                        color=discord.Color.blue()
+                    )
+                    embed.set_image(url=drawn_card['image'])
+                    
+                    if ctx.author.avatar:
+                        embed.set_thumbnail(url=str(ctx.author.avatar.url))
+
+                    if not footer_text:
+                        sl_quotes = [
+                            "The true hunter never rests.",
+                            "Your strength defines your fate.",
+                            "Another card, another step to greatness.",
+                            "The shadows whisper, will you answer?"
+                        ]
+                        footer_text = random.choice(sl_quotes)
+
+                    embed.set_footer(text=footer_text)
+                    await ctx.send(embed=embed)
+
+        except Exception as e:
+            print(f"Error in spawn command: {e}")
+            await ctx.send("An error occurred while processing your request. Please try again.")
+    @commands.command()
+    async def arise(self, ctx):
+        # Simulated card data (replace with your actual card generation logic)
+        ranks = ["E", "D", "C", "B", "A", "S"]
+        card_data = {
+            "name": random.choice(["Shadow Soldier", "High Orc", "Igris", "Tusk", "Iron", "Beru", "Bellion"]),
+            "rank": random.choice(ranks),
+            "strength": random.randint(50, 100),
+            "health": random.randint(50, 100),
+            "agility": random.randint(50, 100)
+        }
+
+        # Calculate an overall rating based on rank and stats
+        stat_avg = sum([card_data["strength"], card_data["health"], card_data["agility"]]) / 3
+        rank_multiplier = (ranks.index(card_data["rank"]) + 1) / len(ranks)
+        overall_rating = int(stat_avg * rank_multiplier)
+
+        embed = discord.Embed(
+            title=f"💀 {card_data['name']} Arises! 💀",
+            description=f"A {card_data['rank']}-Rank shadow has answered your call, Monarch!",
+            color=discord.C0000000000000000
+            olor.from_rgb(75, 0, 130)  # Deep purple color
+        )
+
+        # Function to create stat bar
+        def create_stat_bar(value):
+            filled = min(value // 17, 6)
+            empty = 6 - filled
+            return f"{'▰' * filled}{'▱' * empty} {value}"
+
+        # Add each stat as a separate field
+        embed.add_field(name="𝐒𝐓𝐑", value=create_stat_bar(card_data['strength']), inline=False)
+        embed.add_field(name="𝐇𝐄𝐀𝐋𝐓𝐇", value=create_stat_bar(card_data['health']), inline=False)
+        embed.add_field(name="𝐀𝐆𝐈", value=create_stat_bar(card_data['agility']), inline=False)
+
+        embed.add_field(name="Rank", value=f"**{card_data['rank']}**", inline=False)
+        embed.set_image(url="https://i.imgur.com/BOcNBHk.jpeg")
+        embed.set_thumbnail(url=ctx.author.avatar.url)
+        embed.set_footer(text="'I alone level up.' - Sung Jin-Woo", icon_url=ctx.author.avatar.url)
+        embed.timestamp = discord.utils.utcnow()
+
+        await ctx.send(embed=embed)
+async def setup(bot):
+    await bot.add_cog(SpawnCommands(bot))

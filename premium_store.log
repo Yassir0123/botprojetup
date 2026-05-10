@@ -1,0 +1,5 @@
+2026-05-10 19:57:25,136 - PremiumStore - INFO - PreniumCommands initialized. Image path: C:\Users\PC\Desktop\BotProject-master (9)-20251027T190123Z-1-001\BotProject-master (9)\pages\..\storeimages
+2026-05-10 19:57:25,140 - adventure_commands - INFO - Setting up AdventureCommands cog
+2026-05-10 19:57:25,223 - discord.client - INFO - logging in using static token
+2026-05-10 19:57:26,749 - discord.gateway - INFO - Shard ID None has connected to Gateway (Session ID: 27522775661bc708be290c650b900535).
+2026-05-10 19:58:53,097 - root - INFO - Starting dungeon exploration for user 638185196406964234 with difficulty B-Rank

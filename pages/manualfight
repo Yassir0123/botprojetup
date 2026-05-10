@@ -1,0 +1,414 @@
+    # Add this new command to the EmFightCommands class
+    #@commands.command(name="manual_fight", aliases=["mf", "manualfight"])
+    async def manual_fight(self, ctx):
+        start_time = time.time()
+        await ctx.send("Initiating manual fight...")
+
+        try:
+            # Use the retry version for important queries
+            user_data = await self.get_user_data_with_retry(ctx.author.id)
+            if not user_data:
+                await ctx.send("You need to be registered and have a team to use this command.")
+                return
+
+            if not user_data['fighters']:
+                await ctx.send("You need at least one fighter card in your team to proceed with the fight.")
+                return
+
+            # Check fight_current status with retry
+            fight_current_query = """
+            SELECT fight_current
+            FROM user
+            WHERE user_authorid = %s
+            """
+            fight_current_result = await execute_query_with_retry(fight_current_query, (user_data['user_authorid'],))
+
+            if fight_current_result and fight_current_result[0]['fight_current'] == 1:
+                await ctx.send("You are already in a fight. Please complete your current battle before starting a new one.")
+                return
+
+            # Get fight timer information separately
+            fight_timer_query = """
+            SELECT fight_timer
+            FROM user
+            WHERE user_authorid = %s
+            """
+            fight_timer_result = await execute_query_with_retry(fight_timer_query, (user_data['user_authorid'],))
+
+            # Update fight_current to 1 before starting the fight
+            update_fight_current_query = """
+            UPDATE user
+            SET fight_current = 1
+            WHERE user_authorid = %s
+            """
+            await execute_query_with_retry(update_fight_current_query, (user_data['user_authorid'],))
+
+            if not fight_timer_result or fight_timer_result[0]['fight_timer'] is None:
+                # Update fight timer for the user
+                new_fight_timer = datetime.datetime.now()
+                update_timer_query = """
+                UPDATE user
+                SET fight_timer = %s
+                WHERE user_authorid = %s
+                """
+                await execute_query_with_retry(update_timer_query, (new_fight_timer, user_data['user_authorid']))
+            else:
+                fight_timer = fight_timer_result[0]['fight_timer']
+                time_elapsed = datetime.datetime.now() - fight_timer
+                if time_elapsed.total_seconds() < 300:  # 5 minutes
+                    time_remaining = 300 - int(time_elapsed.total_seconds())
+                    await ctx.send(f"You need to wait {time_remaining//60} minutes and {time_remaining%60} seconds before you can fight again.")
+                    # Reset fight_current to 0
+                    reset_fight_current_query = """
+                    UPDATE user
+                    SET fight_current = 0
+                    WHERE user_authorid = %s
+                    """
+                    await execute_query_with_retry(reset_fight_current_query, (user_data['user_authorid'],))
+                    return
+
+                # Update fight timer for the user
+                new_fight_timer = datetime.datetime.now()
+                update_timer_query = """
+                UPDATE user
+                SET fight_timer = %s
+                WHERE user_authorid = %s
+                """
+                await execute_query_with_retry(update_timer_query, (new_fight_timer, user_data['user_authorid']))
+
+            # Get all users except the one who initiated the fight
+            all_users_query = """
+            SELECT u.user_id, u.user_authorid, t.team_id
+            FROM user u
+            JOIN team t ON u.user_id = t.user_id
+            WHERE u.user_id != %s
+            """
+            all_users = await execute_query_with_retry(all_users_query, (user_data['user_id'],))
+
+            # Filter users with fighter cards in their team
+            valid_opponents = []
+            for opponent in all_users:
+                fighters_query = """
+                SELECT c.card_id, c.card_name, c.image, c.card_rank, uc.power_stat, uc.health_stat, uc.speed_stat, 
+                    uc.attack_stat, uc.defence_stat, uc.current_level, tc.position,
+                    uc.current_xp, uc.id_enhancer, uc.fight_count, uc.charm_attack, uc.charm_defence, 
+                    uc.charm_speed, uc.charm_health,
+                    uc.attack_count, uc.defence_count, uc.speed_count, uc.health_count
+                FROM team_cards tc
+                JOIN card c ON tc.card_id = c.card_id
+                JOIN user_cards uc ON tc.card_id = uc.card_id AND uc.user_id = %s
+                WHERE tc.team_id = %s AND c.type_card = 'Fighter'
+                ORDER BY tc.position
+                """
+                fighters = await execute_query_with_retry(fighters_query, (opponent['user_id'], opponent['team_id']))
+                if fighters:
+                    opponent['fighters'] = fighters
+                    valid_opponents.append(opponent)
+
+            if not valid_opponents:
+                await ctx.send("No suitable opponents found. Please try again later.")
+                # Reset fight_current to 0
+                reset_fight_current_query = """
+                UPDATE user
+                SET fight_current = 0
+                WHERE user_authorid = %s
+                """
+                await execute_query_with_retry(reset_fight_current_query, (user_data['user_authorid'],))
+                return
+
+            # Randomly select an opponent
+            opponent_data = random.choice(valid_opponents)
+
+            print(f"Fight preparation time: {time.time() - start_time:.2f} seconds")
+            user_data['fighters'] = await self.apply_charm_effects(user_data['fighters'], user_data['user_id'])
+            opponent_data['fighters'] = await self.apply_charm_effects(opponent_data['fighters'], opponent_data['user_id'])
+
+            # Start the manual fight
+            await self.start_manual_fight(ctx, user_data, opponent_data, is_challenge=False, is_squad=False)
+
+        except Exception as e:
+            # Reset fight_current to 0 in case of any error
+            reset_fight_current_query = """
+            UPDATE user
+            SET fight_current = 0
+            WHERE user_authorid = %s
+            """
+            await execute_query_with_retry(reset_fight_current_query, (str(ctx.author.id),))
+            
+            await ctx.send(f"An error occurred: {str(e)}")
+            print(f"Error in manual_fight command: {e}")
+            traceback.print_exc()
+
+    # Add this new method to the EmFightCommands class
+    async def start_manual_fight(self, ctx, user_data, opponent_data, is_challenge, is_squad):
+        try:
+            # Sort fighters based on position
+            user_data['fighters'].sort(key=lambda x: x.get('position', float('inf')))
+            opponent_data['fighters'].sort(key=lambda x: x.get('position', float('inf')))
+            
+            # Track fighter card IDs that participate in the battle
+            user_fighter_card_ids = [fighter['card_id'] for fighter in user_data['fighters']]
+            
+            # Modified user fetching logic to handle squad battles
+            user_name = None
+            opponent_name = None
+            
+            if is_squad:
+                user = await self.fetch_user_with_retry(user_data['user_authorid'])
+                user_name = user.name if user else "Unknown User"
+                opponent_name = "Squad Opponent"  # Default name for squad battles
+            else:
+                # Regular battle user fetching
+                user = await self.fetch_user_with_retry(user_data['user_authorid'])
+                opponent = await self.fetch_user_with_retry(opponent_data['user_authorid'])
+                
+                user_name = user.name if user else f"Unknown User (ID: {user_data['user_authorid']})"
+                opponent_name = opponent.name if opponent else f"Unknown Opponent (ID: {opponent_data['user_authorid']})"
+
+            # Proceed with the fight
+            if is_squad:
+                await ctx.send(f"Manual squad battle starting between {user_name}'s squad and the opponent squad!")
+            else:
+                await ctx.send(f"Manual fight starting between {user_name} and {opponent_name}!")
+                
+            await asyncio.sleep(1)  # 1-second pause before the fight starts
+
+            await self.conduct_manual_fight(ctx, user_data['fighters'], opponent_data['fighters'], user_name, opponent_name, is_challenge, is_squad, user_fighter_card_ids)
+
+        except Exception as e:
+            # Create detailed error message
+            error_message = (
+                f"🚨 <@818132161534230559> Error in manual fight system!\n"
+                f"```\nError: {str(e)}\n"
+                f"Channel: {ctx.channel.name} ({ctx.channel.id})\n"
+                f"Server: {ctx.guild.name} ({ctx.guild.id})\n"
+                f"Command User: {ctx.author.name} ({ctx.author.id})\n"
+                f"User data: {json.dumps(user_data, indent=2)}\n"
+                f"Opponent data: {json.dumps(opponent_data, indent=2)}```\n"
+                f"Traceback:\n```python\n{traceback.format_exc()}```"
+            )
+            
+            try:
+                # Send error to support channel
+                support_channel = ctx.bot.get_channel(1336306672741908561)
+                if support_channel:
+                    # Split message if it's too long
+                    if len(error_message) > 2000:
+                        parts = [error_message[i:i+1990] for i in range(0, len(error_message), 1990)]
+                        for i, part in enumerate(parts):
+                            if i == 0:  # First part includes the ping
+                                await support_channel.send(part)
+                            else:
+                                await support_channel.send(f"```{part}```")
+                    else:
+                        await support_channel.send(error_message)
+                
+                # Send generic message to user
+                await ctx.send("An unexpected error occurred. Our support team has been notified and will investigate the issue.")
+                
+            except Exception as send_error:
+                print(f"Failed to send error to support channel: {str(send_error)}")
+                print(error_message)
+                await ctx.send("An unexpected error occurred. Please try again later.")
+        finally:
+            # Always reset fight_current at the end, regardless of success or failure
+            try:
+                reset_fight_current_query = """
+                UPDATE user
+                SET fight_current = 0
+                WHERE user_authorid = %s
+                """
+                await execute_query_with_retry(reset_fight_current_query, (str(ctx.author.id),))
+            except Exception as reset_error:
+                print(f"Error resetting fight_current: {reset_error}")
+
+    # Add this new method to the EmFightCommands class
+    async def conduct_manual_fight(self, ctx, user_fighters, opponent_fighters, user_name, opponent_name, is_challenge, is_squad, fighter_card_ids):
+        try:
+            def safe_sort_key(x):
+                return x.get('position', float('inf'))
+
+            user_team = sorted(user_fighters, key=safe_sort_key)
+            opponent_team = sorted(opponent_fighters, key=safe_sort_key)
+
+            if not user_team or not opponent_team:
+                await ctx.send("Error: One or both teams are empty. Cannot conduct the fight.")
+                reset_stats_query = """
+                UPDATE user
+                SET fight_current = 0
+                WHERE user_authorid = %s
+                """
+                await execute_query_with_retry(reset_stats_query, (ctx.author.id,))
+                return
+
+            # Initialize current_health and determine speed tie resolution
+            for fighter in user_team + opponent_team:
+                fighter['current_health'] = fighter['health_stat']
+            
+            # Set a consistent speed tie resolution for the entire fight
+            user_goes_first_in_tie = random.choice([True, False])
+
+            embed, file = await self.create_fight_embed(user_team[0], opponent_team[0], user_name, opponent_name, is_challenge=False)
+            battle_log = []
+            
+            # Create initial view with attack button (disabled initially)
+            view = AttackButton(
+                self, ctx, user_team[0], opponent_team[0], 
+                user_name, opponent_name, battle_log, 
+                is_user_turn=False  # Initially disabled
+            )
+            
+            fight_message = await ctx.send(file=file, embed=embed, view=view)
+
+            while user_team and opponent_team:
+                user_fighter = user_team[0]
+                opponent_fighter = opponent_team[0]
+
+                # Modified speed comparison with tie resolution
+                if user_fighter['speed_stat'] > opponent_fighter['speed_stat']:
+                    # User goes first
+                    is_user_turn = True
+                elif user_fighter['speed_stat'] < opponent_fighter['speed_stat']:
+                    # Opponent goes first
+                    is_user_turn = False
+                else:  # Speed tie
+                    is_user_turn = user_goes_first_in_tie
+                
+                # Main fight loop
+                while user_fighter['current_health'] > 0 and opponent_fighter['current_health'] > 0:
+                    # If it's the user's turn, wait for button press
+                    if is_user_turn:
+                        # Update the view with a new attack button (enabled)
+                        view = AttackButton(
+                            self, ctx, user_fighter, opponent_fighter, 
+                            user_name, opponent_name, battle_log, 
+                            is_user_turn=True
+                        )
+                        
+                        # Update the message with the new view
+                        await fight_message.edit(view=view)
+                        
+                        # Wait for the button to be pressed or timeout
+                        await view.wait()
+                        
+                        # Perform user attack
+                        battle_log.extend(await self.perform_attack(user_fighter, opponent_fighter, True))
+                        embed = await self.update_fight_embed(embed, user_fighter, opponent_fighter, user_name, opponent_name, battle_log)
+                        
+                        # Update message with new embed and disabled button
+                        view = AttackButton(
+                            self, ctx, user_fighter, opponent_fighter, 
+                            user_name, opponent_name, battle_log, 
+                            is_user_turn=False
+                        )
+                        await fight_message.edit(embed=embed, view=view)
+                        
+                        # Switch turns
+                        is_user_turn = False
+                        
+                        # Check if opponent is defeated
+                        if opponent_fighter['current_health'] <= 0:
+                            battle_log.append(self.get_defeat_message(opponent_fighter['card_name'], True))
+                            opponent_team.pop(0)
+                            if opponent_team:
+                                battle_log.append("🆕 **Next opponent incoming!**")
+                                battle_log.append(self.get_new_card_message(opponent_team[0]['card_name'], is_user_turn=False))
+                                opponent_fighter = opponent_team[0]
+                                
+                                # Update the fight image
+                                new_file = await self.update_fight_image(user_fighter, opponent_fighter)
+                                await fight_message.remove_attachments(fight_message.attachments)
+                                await fight_message.edit(attachments=[new_file], embed=embed, view=view)
+                            break
+                    else:
+                        # Opponent's turn - automatic attack
+                        await asyncio.sleep(1)  # Pause for effect
+                        
+                        # Perform opponent attack
+                        battle_log.extend(await self.perform_attack(opponent_fighter, user_fighter, False))
+                        embed = await self.update_fight_embed(embed, user_fighter, opponent_fighter, user_name, opponent_name, battle_log)
+                        
+                        # Update message with new embed
+                        await fight_message.edit(embed=embed)
+                        
+                        # Switch turns
+                        is_user_turn = True
+                        
+                        # Check if user is defeated
+                        if user_fighter['current_health'] <= 0:
+                            battle_log.append(self.get_defeat_message(user_fighter['card_name'], False))
+                            user_team.pop(0)
+                            if user_team:
+                                battle_log.append("🔄 **Next card incoming!**")
+                                battle_log.append(self.get_new_card_message(user_team[0]['card_name'], is_user_turn=True))
+                                user_fighter = user_team[0]
+                                
+                                # Update the fight image
+                                new_file = await self.update_fight_image(user_fighter, opponent_fighter)
+                                await fight_message.remove_attachments(fight_message.attachments)
+                                await fight_message.edit(attachments=[new_file], embed=embed, view=view)
+                            break
+                    
+                    # Short pause between turns
+                    await asyncio.sleep(0.5)
+                
+                # Check if either team is empty
+                if not user_team or not opponent_team:
+                    break
+
+            # Announce the winner
+            await self.announce_winner(ctx, user_name, opponent_name, user_team, is_challenge, is_squad, fighter_card_ids)
+
+        except Exception as e:
+            error_message = (
+                f"🚨 <@818132161534230559> Error in manual fight system!\n"
+                f"```\nError: {str(e)}\n"
+                f"Channel: {ctx.channel.name} ({ctx.channel.id})\n"
+                f"Server: {ctx.guild.name} ({ctx.guild.id})\n"
+                f"Command User: {ctx.author.name} ({ctx.author.id})\n"
+                f"User data: {json.dumps(user_fighters, indent=2)}\n"
+                f"Opponent data: {json.dumps(opponent_fighters, indent=2)}```\n"
+                f"Traceback:\n```python\n{traceback.format_exc()}```"
+            )
+            
+            try:
+                reset_stats_query = """
+                UPDATE user
+                SET fight_current = 0
+                WHERE user_authorid = %s
+                """
+                await execute_query_with_retry(reset_stats_query, (ctx.author.id,))
+                # Send error to support channel
+                support_channel = ctx.bot.get_channel(1336306672741908561)
+                if support_channel:
+                    # Split message if it's too long
+                    if len(error_message) > 2000:
+                        parts = [error_message[i:i+1990] for i in range(0, len(error_message), 1990)]
+                        for i, part in enumerate(parts):
+                            if i == 0:  # First part includes the ping
+                                await support_channel.send(part)
+                            else:
+                                await support_channel.send(f"```{part}```")
+                    else:
+                        await support_channel.send(error_message)
+                
+                # Send generic message to user
+                await ctx.send("An unexpected error occurred. Our support team has been notified and will investigate the issue.")
+                
+            except Exception as send_error:
+                # If error channel sending fails, log to console
+                print(f"Failed to send error to support channel: {str(send_error)}")
+                print(error_message)
+                # Still send generic message to user
+                await ctx.send("An unexpected error occurred. Please try again later.")
+        finally:
+            # Always reset fight_current at the end, regardless of success or failure
+            try:
+                reset_fight_current_query = """
+                UPDATE user
+                SET fight_current = 0
+                WHERE user_authorid = %s
+                """
+                await execute_query_with_retry(reset_fight_current_query, (str(ctx.author.id),))
+            except Exception as reset_error:
+                print(f"Error resetting fight_current: {reset_error}")
