@@ -5,7 +5,7 @@ from config import TOKEN
 # Set up bot with message content intents
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix=('sl ', 'Sl ','SL ','sL '), intents=intents)
+bot = commands.Bot(command_prefix=('sv ', 'Sv ','SV ','sV '), intents=intents)
 bot.remove_command('help')
 
 async def main():
@@ -38,7 +38,7 @@ async def main():
     await bot.load_extension("pages.ascend")#done aio
     #await bot.load_extension("pages.squad")#done
     await bot.load_extension("pages.autoreset")
-    await bot.load_extension("pages.vote")
+#await bot.load_extension("pages.vote")
     await bot.load_extension("pages.skill")#done aio
     await bot.load_extension("pages.market")#done aio
     await bot.load_extension("pages.referal")

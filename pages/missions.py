@@ -13,6 +13,9 @@ import uuid
 import aiomysql
 from typing import Optional, Union, List, Dict, Any, Tuple
 from utils.database import execute_query_with_retry, get_metrics, get_connection, release_connection
+from utils.activity_state import claim_user_activity, cleanup_stale_user_activity, release_user_activity
+from utils.discord_safe import safe_defer, safe_edit, safe_followup_send, safe_response_send, safe_send
+from utils.error_reporting import compact_card_rows, compact_opponent_rows, send_support_error
 async def get_user_multilanguage(user_authorid: int) -> int:
     """
     Fetch multilanguage flag for a Discord user. Fallback to 0 (English).
@@ -68,7 +71,10 @@ class CommandLockRegistry:
             await asyncio.sleep(300)  # Run every 5 minutes
             async with self.lock_creation:
                 if len(self.locks) > 10000:
-                    keys_to_remove = list(self.locks.keys())[:5000]
+                    keys_to_remove = [
+                        key for key, lock in self.locks.items()
+                        if not lock.locked()
+                    ][:5000]
                     for key in keys_to_remove:
                         del self.locks[key]
 
@@ -104,7 +110,7 @@ def command_lock(command_name=None):
                     lock.release()
                     print(f"[{exec_id}] Released lock for command {cmd_name}, user {user_id}")
             except asyncio.TimeoutError:
-                await ctx.send(_tr(
+                await safe_send(ctx, _tr(
                     lang,
                     "You're already running this command. Please wait for it to complete.",
                     "أنت تستخدم هذا الأمر بالفعل. يرجى الانتظار حتى يكتمل.",
@@ -174,7 +180,7 @@ def command_cooldown(rate=1, per=3.0, type=commands.BucketType.user):
                 retry_after = bucket.update_rate_limit()
                 if retry_after:
                     remaining = round(retry_after, 1)
-                    await ctx.send(_tr(
+                    await safe_send(ctx, _tr(
                         lang,
                         f"⏰ Command on cooldown. Please wait {remaining} seconds.",
                         f"⏰ الأمر على فترة انتظار. الرجاء الانتظار {remaining} ثانية.",
@@ -231,7 +237,7 @@ class MissionView(discord.ui.View):
                             ),
                             color=discord.Color.red()
                         )
-                        await self.message.edit(embed=timeout_embed, view=self, attachments=[])
+                        await safe_edit(self.message, embed=timeout_embed, view=self, attachments=[])
                     except discord.errors.NotFound:
                         logging.info(f"Message not found when handling timeout for user {self.original_user.id}")
                     except Exception as e:
@@ -250,7 +256,7 @@ class MissionView(discord.ui.View):
         """Check if the user interacting with the button is the original command user"""
         lang = await _get_lang(interaction.user)
         if interaction.user.id != self.original_user.id:
-            await interaction.response.send_message(_tr(
+            await safe_response_send(interaction.response, _tr(
                 lang,
                 "Only the user who started this mission can use these buttons!",
                 "فقط المستخدم الذي بدأ هذه المهمة يمكنه استخدام هذه الأزرار!",
@@ -279,12 +285,16 @@ class MissionView(discord.ui.View):
         
     @discord.ui.button(label="Start", style=discord.ButtonStyle.green, custom_id="start_mission")
     async def start_mission(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer()
+        if self.mission_started:
+            await safe_defer(interaction.response)
+            return
+
         self.mission_started = True
+        await safe_defer(interaction.response)
         lang = await _get_lang(interaction.user)
         for child in self.children:
             child.disabled = True
-        await interaction.message.edit(view=self)
+        await safe_edit(interaction.message, view=self)
         
         user_id = None
         try:
@@ -331,7 +341,7 @@ class MissionView(discord.ui.View):
             ))
             embed.add_field(name=_tr(lang, "⚔️ Mission Battle", "⚔️ معركة المهمة", "⚔️ Combat de mission"),
                             value=battle_display, inline=False)
-            await interaction.message.edit(attachments=files, embed=embed, view=None)
+            await safe_edit(interaction.message, attachments=files, embed=embed, view=None)
             await asyncio.sleep(2)
 
             max_turns = 200
@@ -359,7 +369,7 @@ class MissionView(discord.ui.View):
                 )
                 embed.set_field_at(-1, name=_tr(lang, "⚔️ Mission Battle", "⚔️ معركة المهمة", "⚔️ Combat de mission"),
                                    value=battle_display, inline=False)
-                await interaction.message.edit(embed=embed)
+                await safe_edit(interaction.message, embed=embed, min_interval=1.0)
                 await asyncio.sleep(3)
 
                 if monster['current_health'] <= 0:
@@ -382,7 +392,7 @@ class MissionView(discord.ui.View):
                 )
                 embed.set_field_at(-1, name=_tr(lang, "⚔️ Mission Battle", "⚔️ معركة المهمة", "⚔️ Combat de mission"),
                                    value=battle_display, inline=False)
-                await interaction.message.edit(embed=embed)
+                await safe_edit(interaction.message, embed=embed, min_interval=1.0)
                 await asyncio.sleep(3)
 
                 if user_card['current_health'] <= 0:
@@ -398,14 +408,23 @@ class MissionView(discord.ui.View):
                     )
                     embed.set_field_at(-1, name=_tr(lang, "⚔️ Mission Battle", "⚔️ معركة المهمة", "⚔️ Combat de mission"),
                                        value=battle_display, inline=False)
-                    await interaction.message.edit(embed=embed)
+                    await safe_edit(interaction.message, embed=embed)
                     await asyncio.sleep(3)
 
             if battle_result == 'win':
                 try:
                     reward_result = await self.process_mission_victory(user_id)
-                    if reward_result:
+                    if reward_result is not None:
                         money_prize = reward_result
+                        try:
+                            quest_status = await self.bot.get_cog('MissionCommands').update_quest_progress(user_id)
+                            if quest_status is not None:
+                                if quest_status == 1:
+                                    print("🎉 Congratulations! You've completed the 'Complete 5 missions' quest!")
+                                else:
+                                    print("📊 Your progress for the 'Complete 5 missions' quest has been updated.")
+                        except Exception as quest_error:
+                            logging.error(f"Mission quest progress error after reward: {quest_error}")
                         embed.add_field(
                             name=_tr(lang, "🎉 Mission Complete!", "🎉 اكتملت المهمة!", "🎉 Mission terminée !"),
                             value=_tr(lang,
@@ -416,7 +435,7 @@ class MissionView(discord.ui.View):
                         )
                         self.mission_completed = True
                     else:
-                        raise Exception("Failed to process mission rewards")
+                        self.mission_completed = True
                 except Exception as mission_reward_error:
                     logging.error(f"Mission reward processing error: {mission_reward_error}")
                     logging.error(traceback.format_exc())
@@ -444,7 +463,7 @@ class MissionView(discord.ui.View):
                 except Exception as e:
                     logging.error(f"Error updating mission_current after mission failure: {e}")
             
-            await interaction.message.edit(embed=embed, view=None)
+            await safe_edit(interaction.message, embed=embed, view=None)
             self.stop()
 
         except Exception as overall_error:
@@ -457,7 +476,7 @@ class MissionView(discord.ui.View):
                                 "Une erreur inattendue s'est produite pendant la mission. Veuillez réessayer."),
                 color=discord.Color.red()
             )
-            await interaction.message.edit(embed=error_embed, view=None, attachments=[])
+            await safe_edit(interaction.message, embed=error_embed, view=None, attachments=[])
             await self.send_error_to_support(interaction, overall_error)
 
         finally:
@@ -478,6 +497,11 @@ class MissionView(discord.ui.View):
     async def process_mission_victory(self, user_id, conn=None):
         """Process mission victory rewards with transaction safety"""
         async with conn.cursor(aiomysql.DictCursor) as cursor:
+            await cursor.execute("SELECT mission_current FROM user WHERE user_id = %s FOR UPDATE", (user_id,))
+            user_state = await cursor.fetchone()
+            if not user_state or user_state.get('mission_current') != 1:
+                return None
+
             premium_level, is_premium_active = await self.check_premium_status(user_id, cursor)
             money_prize = random.randint(self.mission_card['min_moneycap'], self.mission_card['max_moneycap'])
             await cursor.execute("SELECT 1 FROM user_cards WHERE user_id = %s AND card_id = 107", (user_id,))
@@ -490,12 +514,6 @@ class MissionView(discord.ui.View):
             await cursor.execute("UPDATE user SET won_currency = won_currency + %s WHERE user_id = %s", (money_prize, user_id))
             await cursor.execute("UPDATE user SET mission_streak = mission_streak + 1 WHERE user_id = %s", (user_id,))
             await cursor.execute("UPDATE user SET mission_current = 0 WHERE user_id = %s", (user_id,))
-            quest_status = await self.bot.get_cog('MissionCommands').update_quest_progress(user_id)
-            if quest_status is not None:
-                if quest_status == 1:
-                    print("🎉 Congratulations! You've completed the 'Complete 5 missions' quest!")
-                else:
-                    print("📊 Your progress for the 'Complete 5 missions' quest has been updated.")
             return money_prize
 
     async def check_premium_status(self, user_id, cursor):
@@ -560,29 +578,24 @@ class MissionView(discord.ui.View):
 
     async def send_error_to_support(self, interaction, error):
         """Send error information to support channel"""
-        error_message = (
-            f"🚨 <@818132161534230559> Error in Mission system!\n"
-            f"```\nError: {str(error)}\n"
-            f"Channel: {interaction.channel.name} ({interaction.channel.id})\n"
-            f"Server: {interaction.guild.name} ({interaction.guild.id})\n"
-            f"Command User: {interaction.user.name} ({interaction.user.id})\n```"
-        )
-        user_data_message = f"User data:\n```json\n{json.dumps(self.user_fighter_cards, indent=2)[:1900]}```"
-        opponent_data_message = f"Opponent data:\n```json\n{json.dumps(self.mission_card, indent=2)[:1900]}```"
-        traceback_message = f"Traceback:\n```python\n{traceback.format_exc()[:1900]}```"
-
         try:
-            support_channel = self.bot.get_channel(1336306672741908561)
-            if support_channel:
-                await support_channel.send(error_message)
-                await support_channel.send(user_data_message)
-                await support_channel.send(opponent_data_message)
-                await support_channel.send(traceback_message)
-                logging.info("Error message successfully sent to support channel")
+            sent = await send_support_error(
+                self.bot,
+                1336306672741908561,
+                "Mission system",
+                error,
+                interaction=interaction,
+                extra={
+                    "user_cards": compact_card_rows(self.user_fighter_cards),
+                    "opponent": compact_opponent_rows(self.mission_card),
+                },
+            )
+            if sent:
+                logging.info("Compact error report successfully sent to support channel")
             else:
                 logging.error("Support channel not found")
             try:
-                await interaction.followup.send(
+                await safe_followup_send(interaction.followup,
                     _tr(await _get_lang(interaction.user),
                         "An unexpected error occurred. Our support team has been notified and will investigate the issue.",
                         "حدث خطأ غير متوقع. تم إخطار فريق الدعم لدينا وسيحقق في المشكلة.",
@@ -591,7 +604,7 @@ class MissionView(discord.ui.View):
                     ephemeral=True
                 )
             except discord.errors.InteractionResponded:
-                await interaction.channel.send(
+                await safe_send(interaction.channel,
                     f"{interaction.user.mention} " + _tr(await _get_lang(interaction.user),
                         "An unexpected error occurred. Our support team has been notified and will investigate the issue.",
                         "حدث خطأ غير متوقع. تم إخطار فريق الدعم لدينا وسيحقق في المشكلة.",
@@ -600,9 +613,8 @@ class MissionView(discord.ui.View):
                 )
         except Exception as send_error:
             logging.error(f"Failed to send error to support channel: {str(send_error)}")
-            logging.error(f"Original error message: {error_message}")
             try:
-                await interaction.followup.send(
+                await safe_followup_send(interaction.followup,
                     _tr(await _get_lang(interaction.user),
                         "An unexpected error occurred. Please try again later.",
                         "حدث خطأ غير متوقع. يرجى المحاولة لاحقًا.",
@@ -611,7 +623,7 @@ class MissionView(discord.ui.View):
                     ephemeral=True
                 )
             except:
-                await interaction.channel.send(
+                await safe_send(interaction.channel,
                     f"{interaction.user.mention} " + _tr(await _get_lang(interaction.user),
                         "An unexpected error occurred. Please try again later.",
                         "حدث خطأ غير متوقع. يرجى المحاولة لاحقًا.",
@@ -621,7 +633,7 @@ class MissionView(discord.ui.View):
 
     @discord.ui.button(label="Reroll", style=discord.ButtonStyle.primary, custom_id="reroll_mission")
     async def reroll_mission(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer()
+        await safe_defer(interaction.response)
         lang = await _get_lang(interaction.user)
         new_mission_card = await self.bot.get_cog('MissionCommands').get_random_mission_card(self.mission_card['missioncards_id'])
         if new_mission_card:
@@ -668,9 +680,9 @@ class MissionView(discord.ui.View):
                                       "'Je monte de niveau seul.' - Sung Jin-Woo"))
 
             button.disabled = True
-            await interaction.message.edit(attachments=files, embed=embed, view=self)
+            await safe_edit(interaction.message, attachments=files, embed=embed, view=self)
         else:
-            await interaction.followup.send(_tr(
+            await safe_followup_send(interaction.followup, _tr(
                 lang,
                 "No new missions available. Please try again later.",
                 "لا توجد مهام جديدة متاحة. يرجى المحاولة لاحقًا.",
@@ -679,7 +691,7 @@ class MissionView(discord.ui.View):
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.red, custom_id="cancel_mission")
     async def cancel_mission(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer()
+        await safe_defer(interaction.response)
         lang = await _get_lang(interaction.user)
         try:
             user_id = await self.bot.get_cog('MissionCommands').get_user_id(interaction.user.id)
@@ -692,7 +704,7 @@ class MissionView(discord.ui.View):
         for child in self.children:
             child.disabled = True
         try:
-            await interaction.message.edit(
+            await safe_edit(interaction.message,
                 content=_tr(lang, "Mission canceled.", "تم إلغاء المهمة.", "Mission annulée."),
                 attachments=[], embed=None, view=None
             )
@@ -904,7 +916,7 @@ class MissionCommands(commands.Cog):
         """Check and update mission state with transaction safety"""
         async with conn.cursor(aiomysql.DictCursor) as cursor:
             await cursor.execute(
-                "SELECT mission_current, mission_timer FROM user WHERE user_id = %s",
+                "SELECT mission_current, mission_timer FROM user WHERE user_id = %s FOR UPDATE",
                 (user_id,)
             )
             result = await cursor.fetchone()
@@ -924,41 +936,48 @@ class MissionCommands(commands.Cog):
         lang = await _get_lang(ctx.author)
         user_id = await self.get_user_id(ctx.author.id)
         if not user_id:
-            await ctx.send(_tr(lang,
+            await safe_send(ctx, _tr(lang,
                                "You need to be registered to use this command.",
                                "تحتاج إلى التسجيل لاستخدام هذا الأمر.",
                                "Vous devez être enregistré pour utiliser cette commande."))
             return
+        await cleanup_stale_user_activity(user_id, "mission_current", "mission_timer", 1800)
         is_in_mission, mission_message = await self.check_and_update_mission_state(user_id)
         if is_in_mission:
-            await ctx.send(_tr(lang,
+            await safe_send(ctx, _tr(lang,
                                mission_message,
                                "أنت تقوم بمهمة بالفعل. يرجى إكمال معركتك الحالية قبل بدء مهمة جديدة.",
                                "Vous êtes déjà en mission. Terminez votre combat en cours avant d'en commencer une nouvelle."))
             return
         elif mission_message:
-            await ctx.send(_tr(lang,
+            await safe_send(ctx, _tr(lang,
                                mission_message,
                                "تم اكتشاف حالة مهمة قديمة وتم إصلاحها. يمكنك الآن بدء مهمة جديدة.",
                                "Un état de mission obsolète a été détecté et corrigé. Vous pouvez maintenant commencer une nouvelle mission."))
         can_start, timer_message = await self.check_mission_timer(user_id)
         if not can_start:
-            await ctx.send(_tr(lang,
+            await safe_send(ctx, _tr(lang,
                                timer_message or "You need to wait a bit before starting another mission.",
                                "تحتاج إلى الانتظار قليلاً قبل بدء مهمة أخرى.",
                                "Vous devez attendre un peu avant de lancer une autre mission."))
             return
         team_id = await self.get_team_id(user_id)
         if not team_id:
-            await ctx.send(_tr(lang,
+            await safe_send(ctx, _tr(lang,
                                "You need to have a team to start a mission.",
                                "تحتاج إلى وجود فريق لبدء مهمة.",
                                "Vous devez avoir une équipe pour commencer une mission."))
             return
-        await self.set_mission_active(user_id)
+        mission_claimed = await self.set_mission_active(user_id)
+        if not mission_claimed:
+            await safe_send(ctx, _tr(lang,
+                               "You are already doing a mission. Please complete your current battle before starting a new one.",
+                               "أنت تقوم بمهمة بالفعل. يرجى إكمال معركتك الحالية قبل بدء مهمة جديدة.",
+                               "Vous êtes déjà en mission. Terminez votre combat en cours avant d'en commencer une nouvelle."))
+            return
         user_fighter_cards = await self.get_user_fighter_cards(team_id, user_id)
         if not user_fighter_cards:
-            await ctx.send(_tr(lang,
+            await safe_send(ctx, _tr(lang,
                                "You need at least one fighter card in your team to start a mission.",
                                "تحتاج إلى بطاقة مقاتل واحدة على الأقل في فريقك لبدء مهمة.",
                                "Vous avez besoin d'au moins une carte combattant dans votre équipe pour commencer une mission."))
@@ -967,7 +986,7 @@ class MissionCommands(commands.Cog):
         user_fighter_cards = await self.apply_charms(user_fighter_cards)
         mission_card = await self.get_random_mission_card()
         if not mission_card:
-            await ctx.send(_tr(lang,
+            await safe_send(ctx, _tr(lang,
                                "No available missions at the moment. Please try again later.",
                                "لا توجد مهام متاحة في الوقت الحالي. يرجى المحاولة لاحقًا.",
                                "Aucune mission disponible pour le moment. Veuillez réessayer plus tard."))
@@ -1041,22 +1060,20 @@ class MissionCommands(commands.Cog):
 
         view = MissionView(self.bot, user_fighter_cards, mission_card)
         view.original_user = ctx.author
-        message = await ctx.send(files=files, embed=embed, view=view)
+        ok, message = await safe_send(ctx, files=files, embed=embed, view=view)
+        if not ok or message is None:
+            await self.reset_mission_state(user_id)
+            return
         view.message = message
         await view.wait()
 
-    @db_transaction(max_retries=3)
     async def set_mission_active(self, user_id, conn=None):
         """Set mission state to active with transaction safety"""
-        async with conn.cursor(aiomysql.DictCursor) as cursor:
-            await cursor.execute("UPDATE user SET mission_current = 1 WHERE user_id = %s", (user_id,))
+        return await claim_user_activity(user_id, "mission_current")
 
-    @db_transaction(max_retries=3)
     async def reset_mission_state(self, user_id, conn=None):
         """Reset mission state with transaction safety"""
-        async with conn.cursor(aiomysql.DictCursor) as cursor:
-            await cursor.execute("UPDATE user SET mission_current = 0 WHERE user_id = %s", (user_id,))
-        
+        return await release_user_activity(user_id, "mission_current")
+
 async def setup(bot):
     await bot.add_cog(MissionCommands(bot))
-

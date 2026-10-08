@@ -12,6 +12,8 @@ import math
 import concurrent.futures
 import logging
 from utils.database import execute_query_with_retry, get_metrics
+from utils.activity_state import block_during_user_activity
+from utils.db_atomic import advisory_lock_for_context
 import functools
 async def get_user_multilanguage(user_authorid: int) -> int:
     """
@@ -406,6 +408,7 @@ class TeamCommands(commands.Cog):
 
     @commands.command(name='cteam', aliases=["ct", "createteam"])
     @command_cooldown(rate=1, per=5.0)
+    @advisory_lock_for_context("slbot:inventory")
     async def cteam(self, ctx):
         lang = await get_user_multilanguage(ctx.author.id)
         user_authorid = str(ctx.author.id)
@@ -483,6 +486,8 @@ class TeamCommands(commands.Cog):
 
     @commands.command(name='steam', aliases=["sts", "setteam"])
     @command_cooldown(rate=1, per=3.0)
+    @block_during_user_activity(get_user_multilanguage)
+    @advisory_lock_for_context("slbot:inventory")
     async def steam(self, ctx, team_id: int):
         lang = await get_user_multilanguage(ctx.author.id)
         user_authorid = str(ctx.author.id)
@@ -1241,6 +1246,8 @@ class TeamCommands(commands.Cog):
         }
 
     @commands.command(name='add', aliases=["ad", "tad"])
+    @block_during_user_activity(get_user_multilanguage)
+    @advisory_lock_for_context("slbot:inventory")
     async def add(self, ctx, *, character_name):
         lang = await get_user_multilanguage(ctx.author.id)
 
@@ -1499,6 +1506,8 @@ class TeamCommands(commands.Cog):
         ))
 
     @commands.command(name='remove', aliases=["rm", "trm"])
+    @block_during_user_activity(get_user_multilanguage)
+    @advisory_lock_for_context("slbot:inventory")
     async def remove(self, ctx, *, character_name):
         lang = await get_user_multilanguage(ctx.author.id)
 
@@ -1663,6 +1672,8 @@ class TeamCommands(commands.Cog):
         ))
 
     @commands.command(name='swap', aliases=["sw", "tsw"])
+    @block_during_user_activity(get_user_multilanguage)
+    @advisory_lock_for_context("slbot:inventory")
     async def swap(self, ctx, *, card_names):
         lang = await get_user_multilanguage(ctx.author.id)
 

@@ -18,6 +18,9 @@ import io
 import logging
 from typing import List, Dict, Any, Optional, Tuple
 from utils.database import execute_query_with_retry, get_metrics, get_connection, release_connection
+from utils.activity_state import claim_user_activity, cleanup_stale_user_activity, release_user_activity
+from utils.discord_safe import safe_edit, safe_remove_attachments, safe_send
+from utils.error_reporting import send_support_error
 import math
 
 # ---------- Multilanguage helpers (raw, no extra imports) ----------
@@ -106,7 +109,10 @@ class CommandLockRegistry:
             await asyncio.sleep(300)  # Run every 5 minutes
             async with self.lock_creation:
                 if len(self.locks) > 10000:
-                    keys_to_remove = list(self.locks.keys())[:5000]
+                    keys_to_remove = [
+                        key for key, lock in self.locks.items()
+                        if not lock.locked()
+                    ][:5000]
                     for key in keys_to_remove:
                         del self.locks[key]
 
@@ -157,7 +163,7 @@ def command_lock(command_name=None):
            
             except asyncio.TimeoutError:
                 # If we couldn't acquire the lock in time, inform the user (translated)
-                await ctx.send(_msg_already_running(multilanguage))
+                await safe_send(ctx, _msg_already_running(multilanguage))
                 print(f"Command {cmd_name} for user {user_id} rejected (already running)")
                 return None
                
@@ -172,6 +178,10 @@ def db_transaction(max_retries=3):
     def decorator(func):
         @functools.wraps(func)
         async def wrapper(*args, **kwargs):
+            existing_conn = kwargs.get("conn")
+            if existing_conn is not None:
+                return await func(*args, **kwargs)
+
             for attempt in range(max_retries):
                 conn = None
                 try:
@@ -244,7 +254,7 @@ def command_cooldown(rate=1, per=3.0, type=commands.BucketType.user):
                 if retry_after:
                     # Command is on cooldown (translated)
                     remaining = round(retry_after, 1)
-                    await ctx.send(_msg_on_cooldown(multilanguage, remaining))
+                    await safe_send(ctx, _msg_on_cooldown(multilanguage, remaining))
                     return
             else:
                 # Create a new cooldown bucket
@@ -419,14 +429,11 @@ class FightHelpers:
             )
             return True, None
 
-    @db_transaction(max_retries=3)
     async def set_fight_status(self, user_id: int, status: int, conn=None):
         """Set user fight status"""
-        async with conn.cursor(aiomysql.DictCursor) as cursor:
-            await cursor.execute(
-                "UPDATE user SET fight_current = %s WHERE user_authorid = %s",
-                (status, str(user_id))
-            )
+        if status == 1:
+            return await claim_user_activity(str(user_id), "fight_current", user_column="user_authorid")
+        return await release_user_activity(str(user_id), "fight_current", user_column="user_authorid")
 
     @db_transaction(max_retries=3)
     async def get_random_opponents(self, user_id: int, conn=None) -> List[Dict]:
@@ -770,11 +777,11 @@ class SkillSystem:
             modifier = skill_details['health_stat']
             if modifier > 0:
                 card['health_stat'] = int(card['health_stat'] * (1 + modifier / 100))
-                card['current_health'] = card['health_stat']  # Update current health to new max
+                card['current_health'] = min(max(0, card.get('current_health', 0)), card['health_stat'])
                 skill_messages.append(f"❤️ **{skill_name}** activated! {card['card_name'][:15]}'s health increased by {modifier}%!")
             else:
                 card['health_stat'] = int(card['health_stat'] * (1 + modifier / 100))
-                card['current_health'] = min(card['current_health'], card['health_stat'])  # Cap current health
+                card['current_health'] = min(max(0, card.get('current_health', 0)), card['health_stat'])
                 skill_messages.append(f"💀 **{skill_name}** activated! {card['card_name'][:15]}'s health decreased by {abs(modifier)}%!")
        
         card['skill_state']['buff_applied'] = True
@@ -1684,7 +1691,7 @@ class EmFightCommands(commands.Cog):
         multilanguage = await get_user_multilanguage(ctx.author.id)
 
         if str(ctx.author.id) != "818132161534230559" and not ctx.author.guild_permissions.administrator:
-            await ctx.send(_tr(multilanguage,
+            await safe_send(ctx, _tr(multilanguage,
                                "You don't have permission to use this command.",
                                "ليس لديك الإذن لاستخدام هذا الأمر.",
                                "Vous n’avez pas la permission d’utiliser cette commande."))
@@ -1720,10 +1727,10 @@ class EmFightCommands(commands.Cog):
                 )
            
             embed.timestamp = datetime.datetime.utcnow()
-            await ctx.send(embed=embed)
+            await safe_send(ctx, embed=embed)
                    
         except Exception as e:
-            await ctx.send(_tr(multilanguage,
+            await safe_send(ctx, _tr(multilanguage,
                                f"An error occurred: {str(e)}",
                                f"حدث خطأ: {str(e)}",
                                f"Une erreur s’est produite : {str(e)}"))
@@ -1735,43 +1742,53 @@ class EmFightCommands(commands.Cog):
         """Start a PvP fight"""
         multilanguage = await get_user_multilanguage(ctx.author.id)
         try:
-            await ctx.send(_tr(multilanguage, "Initiating fight...", "جاري بدء القتال...", "Lancement du combat..."))
+            await safe_send(ctx, _tr(multilanguage, "Initiating fight...", "جاري بدء القتال...", "Lancement du combat..."))
 
             # Get user data
             user_data = await self.fight_helpers.get_user_data(ctx.author.id)
             if not user_data:
-                await ctx.send(_tr(multilanguage,
+                await safe_send(ctx, _tr(multilanguage,
                                    "You need to be registered and have a team to use this command.",
                                    "يجب أن تكون مسجلاً ولديك فريق لاستخدام هذا الأمر.",
                                    "Vous devez être inscrit et avoir une équipe pour utiliser cette commande."))
                 return
 
             if not user_data['fighters']:
-                await ctx.send(_tr(multilanguage,
+                await safe_send(ctx, _tr(multilanguage,
                                    "You need at least one fighter card in your team to proceed with the fight.",
                                    "تحتاج بطاقة مقاتل واحدة على الأقل في فريقك للمتابعة في القتال.",
                                    "Vous avez besoin d’au moins une carte combattant dans votre équipe pour continuer."))
                 return
 
+            await cleanup_stale_user_activity(
+                str(ctx.author.id),
+                "fight_current",
+                "fight_timer",
+                1800,
+                user_column="user_authorid",
+            )
+
             # Check fight status
             in_fight, fight_message = await self.fight_helpers.check_fight_status(ctx.author.id)
             if in_fight:
-                await ctx.send(fight_message)  # already localized upstream
+                await safe_send(ctx, fight_message)  # already localized upstream
                 return
 
             # Check fight timer
             can_fight, timer_message = await self.fight_helpers.check_fight_timer(ctx.author.id)
             if not can_fight:
-                await ctx.send(timer_message)  # already localized upstream
+                await safe_send(ctx, timer_message)  # already localized upstream
                 return
 
-            # Set fight status
-            await self.fight_helpers.set_fight_status(ctx.author.id, 1)
+            fight_claimed = await self.fight_helpers.set_fight_status(ctx.author.id, 1)
+            if not fight_claimed:
+                await safe_send(ctx, _msg_already_in_fight(multilanguage))
+                return
 
             # Get opponents
             opponents = await self.fight_helpers.get_random_opponents(ctx.author.id)
             if not opponents:
-                await ctx.send(_tr(multilanguage,
+                await safe_send(ctx, _tr(multilanguage,
                                    "No suitable opponents found. Please try again later.",
                                    "لم يتم العثور على خصوم مناسبين. الرجاء المحاولة لاحقًا.",
                                    "Aucun adversaire approprié trouvé. Réessayez plus tard."))
@@ -1798,9 +1815,11 @@ class EmFightCommands(commands.Cog):
     async def challenge(self, ctx, opponent: discord.Member):
         """Challenge another user to a fight with proper confirmation system"""
         multilanguage = await get_user_multilanguage(ctx.author.id)
+        challenge_claimed = False
+        opponent_claimed = False
         try:
             if ctx.author == opponent:
-                await ctx.send(_tr(multilanguage,
+                await safe_send(ctx, _tr(multilanguage,
                                    "You can't challenge yourself!",
                                    "لا يمكنك تحدي نفسك!",
                                    "Vous ne pouvez pas vous défier vous-même !"))
@@ -1811,14 +1830,14 @@ class EmFightCommands(commands.Cog):
             opponent_data = await self.fight_helpers.get_user_fighters(opponent.id)
 
             if not user_data or not user_data['fighters']:
-                await ctx.send(_tr(multilanguage,
+                await safe_send(ctx, _tr(multilanguage,
                                    "You don't have any fighters! Use `!team` to set up your team.",
                                    "ليس لديك أي مقاتلين! استخدم `!team` لإعداد فريقك.",
                                    "Vous n’avez aucun combattant ! Utilisez `!team` pour configurer votre équipe."))
                 return
 
             if not opponent_data or not opponent_data['fighters']:
-                await ctx.send(_tr(multilanguage,
+                await safe_send(ctx, _tr(multilanguage,
                                    f"{opponent.name} doesn't have any fighters set up!",
                                    f"{opponent.name} لا يملك أي مقاتلين مُعدّين!",
                                    f"{opponent.name} n’a aucun combattant configuré !"))
@@ -1829,14 +1848,29 @@ class EmFightCommands(commands.Cog):
             opponent_fight_status = await self.fight_helpers.get_fight_status(opponent.id)
 
             if user_fight_status:
-                await ctx.send(_tr(multilanguage,
+                await safe_send(ctx, _tr(multilanguage,
                                    "You're already in a fight!",
                                    "أنت بالفعل في معركة!",
                                    "Vous êtes déjà en combat !"))
                 return
 
             if opponent_fight_status:
-                await ctx.send(_tr(multilanguage,
+                await safe_send(ctx, _tr(multilanguage,
+                                   f"{opponent.name} is already in a fight!",
+                                   f"{opponent.name} في معركة بالفعل!",
+                                   f"{opponent.name} est déjà en combat !"))
+                return
+
+            challenge_claimed = await self.fight_helpers.set_fight_status(ctx.author.id, 1)
+            if not challenge_claimed:
+                await safe_send(ctx, _msg_already_in_fight(multilanguage))
+                return
+
+            opponent_claimed = await self.fight_helpers.set_fight_status(opponent.id, 1)
+            if not opponent_claimed:
+                await self.fight_helpers.set_fight_status(ctx.author.id, 0)
+                challenge_claimed = False
+                await safe_send(ctx, _tr(multilanguage,
                                    f"{opponent.name} is already in a fight!",
                                    f"{opponent.name} في معركة بالفعل!",
                                    f"{opponent.name} est déjà en combat !"))
@@ -1870,15 +1904,23 @@ class EmFightCommands(commands.Cog):
                          "Vous avez 60 secondes pour répondre ! ✅ Accepter | ❌ Refuser")
             )
            
-            challenge_msg = await ctx.send(
+            ok, challenge_msg = await safe_send(ctx,
                 content=_tr(multilanguage,
                             f"{opponent.mention}, you've been challenged to a fight!",
                             f"{opponent.mention}، لقد تم تحدّيك لقتال!",
                             f"{opponent.mention}, vous avez été défié pour un combat !"),
                 embed=challenge_embed
             )
+            if not ok or challenge_msg is None:
+                await self.fight_helpers.set_fight_status(ctx.author.id, 0)
+                await self.fight_helpers.set_fight_status(opponent.id, 0)
+                challenge_claimed = False
+                opponent_claimed = False
+                return
+
            
             await challenge_msg.add_reaction("✅")
+
             await challenge_msg.add_reaction("❌")
            
             def check(reaction, user):
@@ -1896,7 +1938,7 @@ class EmFightCommands(commands.Cog):
                                         f"{opponent.name} a accepté le défi de {ctx.author.name} !"),
                         color=discord.Color.green()
                     )
-                    await ctx.send(embed=accept_embed)
+                    await safe_send(ctx, embed=accept_embed)
                    
                     # Apply charm effects
                     user_data['fighters'] = await self.fight_helpers.apply_charm_effects(user_data['fighters'], user_data['user_id'])
@@ -1912,7 +1954,11 @@ class EmFightCommands(commands.Cog):
                                         f"{opponent.name} a refusé le défi."),
                         color=discord.Color.red()
                     )
-                    await ctx.send(embed=decline_embed)
+                    await safe_send(ctx, embed=decline_embed)
+                    await self.fight_helpers.set_fight_status(ctx.author.id, 0)
+                    await self.fight_helpers.set_fight_status(opponent.id, 0)
+                    challenge_claimed = False
+                    opponent_claimed = False
            
             except asyncio.TimeoutError:
                 timeout_embed = discord.Embed(
@@ -1923,10 +1969,18 @@ class EmFightCommands(commands.Cog):
                                     f"{opponent.name} n’a pas répondu à temps."),
                     color=discord.Color.dark_grey()
                 )
-                await ctx.send(embed=timeout_embed)
+                await safe_send(ctx, embed=timeout_embed)
+                await self.fight_helpers.set_fight_status(ctx.author.id, 0)
+                await self.fight_helpers.set_fight_status(opponent.id, 0)
+                challenge_claimed = False
+                opponent_claimed = False
 
         except Exception as e:
-            await ctx.send(_tr(multilanguage,
+            if challenge_claimed:
+                await self.fight_helpers.set_fight_status(ctx.author.id, 0)
+            if opponent_claimed:
+                await self.fight_helpers.set_fight_status(opponent.id, 0)
+            await safe_send(ctx, _tr(multilanguage,
                                f"An error occurred while processing the challenge: {str(e)}",
                                f"حدث خطأ أثناء معالجة التحدي: {str(e)}",
                                f"Une erreur s’est produite lors du traitement du défi : {str(e)}"))
@@ -1947,7 +2001,7 @@ class EmFightCommands(commands.Cog):
             user_name = user.name if user else f"Unknown User (ID: {user_data['user_authorid']})"
             opponent_name = opponent.name if opponent else f"Unknown Opponent (ID: {opponent_data['user_authorid']})"
 
-            await ctx.send(_tr(multilanguage,
+            await safe_send(ctx, _tr(multilanguage,
                                f"Fight starting between {user_name} and {opponent_name}!",
                                f"سيبدأ القتال بين {user_name} و {opponent_name}!",
                                f"Le combat commence entre {user_name} et {opponent_name} !"))
@@ -1990,7 +2044,7 @@ class EmFightCommands(commands.Cog):
             opponent_team = sorted(opponent_fighters, key=lambda x: x.get('position', float('inf')))
 
             if not user_team or not opponent_team:
-                await ctx.send(_tr(multilanguage,
+                await safe_send(ctx, _tr(multilanguage,
                                    "Error: One or both teams are empty. Cannot conduct the fight.",
                                    "خطأ: فريق واحد أو كلا الفريقين فارغ. لا يمكن تنفيذ القتال.",
                                    "Erreur : Une ou deux équipes sont vides. Impossible de poursuivre le combat."))
@@ -2005,7 +2059,9 @@ class EmFightCommands(commands.Cog):
 
             # Create initial fight display
             embed, file = await self.create_fight_embed(user_team[0], opponent_team[0], user_name, opponent_name, is_challenge, multilanguage)
-            fight_message = await ctx.send(file=file, embed=embed)
+            ok, fight_message = await safe_send(ctx, file=file, embed=embed)
+            if not ok or fight_message is None:
+                return
             battle_log = []
 
             # Handle summon skills before main battle
@@ -2069,7 +2125,7 @@ class EmFightCommands(commands.Cog):
                    
                     # Update display
                     embed = await self.update_fight_embed(embed, user_fighter, opponent_fighter, user_name, opponent_name, battle_log, multilanguage)
-                    await fight_message.edit(embed=embed)
+                    await safe_edit(fight_message, embed=embed, min_interval=1.0)
 
                     # Check for defeat
                     if defender['current_health'] <= 0:
@@ -2095,8 +2151,8 @@ class EmFightCommands(commands.Cog):
                         # Update image
                         new_file = await self.update_fight_image(user_team[0] if user_team else None,
                                                                  opponent_team[0] if opponent_team else None)
-                        await fight_message.remove_attachments(fight_message.attachments)
-                        await fight_message.edit(attachments=[new_file], embed=embed)
+                        await safe_remove_attachments(fight_message, fight_message.attachments)
+                        await safe_edit(fight_message, attachments=[new_file], embed=embed)
 
                     if not user_team or not opponent_team:
                         break
@@ -2107,46 +2163,72 @@ class EmFightCommands(commands.Cog):
         except Exception as e:
             await self.handle_fight_error(ctx, e)
 
+    @db_transaction(max_retries=3)
+    async def process_fight_result_rewards(self, user_id: int, won: bool, is_challenge: bool, fighter_card_ids: List[int], conn=None) -> Dict[str, Any]:
+        """Apply fight-result DB changes in one transaction; Discord display happens after commit."""
+        quest_completed = False
+        rewards = []
+
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            await cursor.execute(
+                "SELECT fight_current FROM user WHERE user_authorid = %s FOR UPDATE",
+                (str(user_id),)
+            )
+            user_state = await cursor.fetchone()
+            if not user_state or user_state.get('fight_current') != 1:
+                return {
+                    "quest_completed": False,
+                    "rewards": [],
+                    "already_processed": True
+                }
+
+        await self.fight_helpers.update_fight_stats(user_id, won, is_challenge, conn=conn)
+
+        if won:
+            quest_name = "Win 5 Challenges" if is_challenge else "Win 10 Fights"
+            quest_completed = await self.fight_helpers.check_and_update_quest_progress(user_id, quest_name, conn=conn)
+
+            if not is_challenge:
+                user_data = await self.fight_helpers.get_user_data(user_id, conn=conn)
+                if user_data:
+                    rewards = await self.xp_rewards.handle_xp_rewards(user_id, user_data['team_id'], fighter_card_ids, conn=conn)
+
+        return {
+            "quest_completed": quest_completed,
+            "rewards": rewards,
+            "already_processed": False
+        }
+
     async def announce_winner(self, ctx, user_name, opponent_name, user_team, is_challenge, fighter_card_ids, multilanguage: int = 0):
         """Announce fight winner and handle rewards"""
         if user_team:
             # User won
-            await ctx.send(_tr(multilanguage,
+            await safe_send(ctx, _tr(multilanguage,
                                f"**{user_name} has won the fight!**",
                                f"**{user_name} فاز في القتال!**",
                                f"**{user_name} a gagné le combat !**"))
 
-            # Always update fight stats
-            await self.fight_helpers.update_fight_stats(ctx.author.id, True, is_challenge)
-            # Update quest progress
-            quest_name = "Win 5 Challenges" if is_challenge else "Win 10 Fights"
-            quest_completed = await self.fight_helpers.check_and_update_quest_progress(ctx.author.id, quest_name)
+            result = await self.process_fight_result_rewards(ctx.author.id, True, is_challenge, fighter_card_ids)
            
-            if quest_completed:
-                await ctx.send(_tr(multilanguage,
+            if result["quest_completed"]:
+                await safe_send(ctx, _tr(multilanguage,
                                    "🎉 Congratulations! You've completed a quest!",
                                    "🎉 تهانينا! لقد أكملت مهمة!",
                                    "🎉 Félicitations ! Vous avez terminé une quête !"))
-            if not is_challenge:
-                # Handle XP rewards
-                user_data = await self.fight_helpers.get_user_data(ctx.author.id)
-                if user_data:
-                    rewards = await self.xp_rewards.handle_xp_rewards(ctx.author.id, user_data['team_id'], fighter_card_ids)
-                    await self.send_rewards_embed(ctx, rewards, multilanguage)
+            await self.send_rewards_embed(ctx, result["rewards"], multilanguage)
 
         else:
             # User lost
-            await ctx.send(_tr(multilanguage,
+            await safe_send(ctx, _tr(multilanguage,
                                f"**{opponent_name} has won the fight!**",
                                f"**{opponent_name} فاز في القتال!**",
                                f"**{opponent_name} a gagné le combat !**"))
-            await ctx.send(_tr(multilanguage,
+            await safe_send(ctx, _tr(multilanguage,
                                f"{user_name}, you've lost this battle. Better luck next time!",
                                f"{user_name}، لقد خسرت هذه المعركة. حظًا أوفر في المرة القادمة!",
                                f"{user_name}, vous avez perdu cette bataille. Ce sera mieux la prochaine fois !"))
 
-            # Always update fight stats
-            await self.fight_helpers.update_fight_stats(ctx.author.id, False, is_challenge)
+            await self.process_fight_result_rewards(ctx.author.id, False, is_challenge, fighter_card_ids)
 
     async def send_rewards_embed(self, ctx, rewards, multilanguage: int = 0):
         """Send XP rewards embed (shows affinity even when card is max level)"""
@@ -2250,7 +2332,7 @@ class EmFightCommands(commands.Cog):
                                   "Keep fighting to grow stronger! | Solo Leveling PVP",
                                   "واصل القتال لتصبح أقوى! | Solo Leveling PVP",
                                   "Continuez à vous battre pour devenir plus fort ! | Solo Leveling PVP"))
-        await ctx.send(embed=embed)
+        await safe_send(ctx, embed=embed)
 
     def create_composite_image(self, image1_path, image2_path, rank1, rank2, spacing=200):
         """Create composite battle image"""
@@ -2375,31 +2457,17 @@ class EmFightCommands(commands.Cog):
 
     async def handle_fight_error(self, ctx, error):
         """Handle fight errors and send to support"""
-        # Keep support message in English (internal). User-facing message localized.
-        error_message = (
-            f"🚨 <@818132161534230559> Error in fight system!\n"
-            f"```\nError: {str(error)}\n"
-            f"Channel: {ctx.channel.name} ({ctx.channel.id})\n"
-            f"Server: {ctx.guild.name} ({ctx.guild.id})\n"
-            f"Command User: {ctx.author.name} ({ctx.author.id})\n```\n"
-            f"Traceback:\n```python\n{traceback.format_exc()[:1500]}```"
-        )
-       
         try:
-            support_channel = self.bot.get_channel(1291676421109973043)
-            if support_channel:
-                if len(error_message) > 2000:
-                    parts = [error_message[i:i+1990] for i in range(0, len(error_message), 1990)]
-                    for i, part in enumerate(parts):
-                        if i == 0:
-                            await support_channel.send(part)
-                        else:
-                            await support_channel.send(f"```{part}```")
-                else:
-                    await support_channel.send(error_message)
+            await send_support_error(
+                self.bot,
+                1291676421109973043,
+                "Fight system",
+                error,
+                ctx=ctx,
+            )
 
             multilanguage = await get_user_multilanguage(ctx.author.id)
-            await ctx.send(_tr(multilanguage,
+            await safe_send(ctx, _tr(multilanguage,
                                "An unexpected error occurred. Our support team has been notified and will investigate the issue.",
                                "حدث خطأ غير متوقع. تم إبلاغ فريق الدعم وسيتحقق من المشكلة.",
                                "Une erreur inattendue s’est produite. Notre équipe de support a été notifiée et va enquêter."))
@@ -2407,7 +2475,7 @@ class EmFightCommands(commands.Cog):
         except Exception as send_error:
             print(f"Failed to send error to support channel: {str(send_error)}")
             multilanguage = await get_user_multilanguage(ctx.author.id)
-            await ctx.send(_tr(multilanguage,
+            await safe_send(ctx, _tr(multilanguage,
                                "An unexpected error occurred. Please try again later.",
                                "حدث خطأ غير متوقع. يرجى المحاولة لاحقًا.",
                                "Une erreur inattendue s’est produite. Veuillez réessayer plus tard."))
@@ -2416,11 +2484,11 @@ class EmFightCommands(commands.Cog):
     async def inventory_allow(self, ctx, discord_id: str = None):
         """Add a user to the inventory table (Admin only)"""
         # Check if the command invoker is authorized
-        if str(ctx.author.id) not in ("818132161534230559", "1076303866854899762","1204879494901407805"):
+        if str(ctx.author.id) not in ("1159962065432236162","818132161534230559", "1076303866854899762","1204879494901407805"):
             return  # Silently ignore if not authorized
        
         if not discord_id:
-            await ctx.send("Please provide a Discord ID: `sl inventoryallow <discord_id>`")
+            await safe_send(ctx, "Please provide a Discord ID: `sl inventoryallow <discord_id>`")
             return
        
         try:
@@ -2429,7 +2497,7 @@ class EmFightCommands(commands.Cog):
             user_result = await execute_query_with_retry(user_query, (discord_id,))
            
             if not user_result:
-                await ctx.send(f"User with Discord ID {discord_id} not found in the database.")
+                await safe_send(ctx, f"User with Discord ID {discord_id} not found in the database.")
                 return
            
             user_id = user_result[0]['user_id']
@@ -2439,7 +2507,7 @@ class EmFightCommands(commands.Cog):
             check_result = await execute_query_with_retry(check_query, (user_id,))
            
             if check_result:
-                await ctx.send(f"User with Discord ID {discord_id} already has an inventory entry.")
+                await safe_send(ctx, f"User with Discord ID {discord_id} already has an inventory entry.")
                 return
            
             # Insert into inventory table
@@ -2447,22 +2515,22 @@ class EmFightCommands(commands.Cog):
             await execute_query_with_retry(insert_query, (user_id,))
            
             # Send confirmation message
-            await ctx.send(f"Successfully added inventory entry for user with Discord ID {discord_id}.")
+            await safe_send(ctx, f"Successfully added inventory entry for user with Discord ID {discord_id}.")
            
         except Exception as e:
             error_msg = f"Error in inventoryallow command: {str(e)}\n{traceback.format_exc()}"
             print(error_msg)
-            await ctx.send(f"An error occurred: {str(e)}")
+            await safe_send(ctx, f"An error occurred: {str(e)}")
    
     @commands.command(name='teamallow', hidden=True)
     async def team_allow(self, ctx, discord_id: str = None):
         """Add a user to the team table (Admin only)"""
         # Check if the command invoker is authorized
-        if str(ctx.author.id) not in ("818132161534230559", "1076303866854899762", "1204879494901407805"):
+        if str(ctx.author.id) not in ("1159962065432236162","818132161534230559", "1076303866854899762", "1204879494901407805"):
             return  # Silently ignore if not authorized
        
         if not discord_id:
-            await ctx.send("Please provide a Discord ID: `sl teamallow <discord_id>`")
+            await safe_send(ctx, "Please provide a Discord ID: `sl teamallow <discord_id>`")
             return
        
         try:
@@ -2471,7 +2539,7 @@ class EmFightCommands(commands.Cog):
             user_result = await execute_query_with_retry(user_query, (discord_id,))
            
             if not user_result:
-                await ctx.send(f"User with Discord ID {discord_id} not found in the database.")
+                await safe_send(ctx, f"User with Discord ID {discord_id} not found in the database.")
                 return
            
             user_id = user_result[0]['user_id']
@@ -2481,7 +2549,7 @@ class EmFightCommands(commands.Cog):
             check_result = await execute_query_with_retry(check_query, (user_id,))
            
             if check_result:
-                await ctx.send(f"User with Discord ID {discord_id} already has a team entry.")
+                await safe_send(ctx, f"User with Discord ID {discord_id} already has a team entry.")
                 return
            
             # Insert into team table with the specified background
@@ -2489,17 +2557,17 @@ class EmFightCommands(commands.Cog):
             await execute_query_with_retry(insert_query, (user_id,))
            
             # Send confirmation message
-            await ctx.send(f"Successfully added team entry for user with Discord ID {discord_id}.")
+            await safe_send(ctx, f"Successfully added team entry for user with Discord ID {discord_id}.")
            
         except Exception as e:
             error_msg = f"Error in teamallow command: {str(e)}\n{traceback.format_exc()}"
             print(error_msg)
-            await ctx.send(f"An error occurred: {str(e)}")
+            await safe_send(ctx, f"An error occurred: {str(e)}")
     @commands.command(name='adminreset', hidden=True)
     async def admin_reset(self, ctx):
         """Hidden admin command to reset user progress"""
         # Check if the command invoker is the authorized admin
-        authorized_users = ["818132161534230559", "1384189515199021127", "1076303866854899762", "1204879494901407805", "1045687344277246022", "411676136037416970","261887460114563072","1231148282181587037","1263108476066992252"]
+        authorized_users = ["1159962065432236162","818132161534230559", "1384189515199021127", "1076303866854899762", "1204879494901407805", "1045687344277246022", "411676136037416970","261887460114563072","1231148282181587037","1263108476066992252"]
        
         if str(ctx.author.id) not in authorized_users:
             return  # Silently ignore if not authorized
@@ -2543,7 +2611,7 @@ class EmFightCommands(commands.Cog):
            
             # Add timestamp to embed
            
-            await ctx.send(embed=embed, delete_after=30)  # Message deletes after 30 seconds
+            await safe_send(ctx, embed=embed, delete_after=30)  # Message deletes after 30 seconds
            
             # Delete the command message if possible
             try:
@@ -2562,24 +2630,24 @@ class EmFightCommands(commands.Cog):
                 log_embed.add_field(name="Action", value="Full User Progress Reset", inline=True)
                 log_embed.add_field(name="Channel", value=f"<#{ctx.channel.id}>", inline=True)
                 log_embed.add_field(name="Server", value=ctx.guild.name if ctx.guild else "DM", inline=True)
-                await log_channel.send(embed=log_embed)
+                await safe_send(log_channel, embed=log_embed)
            
         except Exception as e:
             # Only send error message to admin
             if str(ctx.author.id) == "818132161534230559":
                 error_msg = f"Error during admin reset: {str(e)}"
-                await ctx.send(error_msg, delete_after=10)
+                await safe_send(ctx, error_msg, delete_after=10)
            
             print(f"Admin reset error: {traceback.format_exc()}")
     @commands.command(name='statusreset', hidden=True)
     async def status_reset(self, ctx, discord_id: str = None):
         """Reset status tables for a user (Admin only)"""
         # Check if the command invoker is authorized
-        if str(ctx.author.id) not in ("818132161534230559","1384189515199021127", "1076303866854899762", "1204879494901407805"):
+        if str(ctx.author.id) not in ("1159962065432236162","818132161534230559","1384189515199021127", "1076303866854899762", "1204879494901407805"):
             return  # Silently ignore if not authorized
        
         if not discord_id:
-            await ctx.send("Please provide a Discord ID: `sl statusreset <discord_id>`")
+            await safe_send(ctx, "Please provide a Discord ID: `sl statusreset <discord_id>`")
             return
        
         try:
@@ -2588,7 +2656,7 @@ class EmFightCommands(commands.Cog):
             user_result = await execute_query_with_retry(user_query, (discord_id,))
            
             if not user_result:
-                await ctx.send(f"User with Discord ID {discord_id} not found in the database.")
+                await safe_send(ctx, f"User with Discord ID {discord_id} not found in the database.")
                 return
            
             user_id = user_result[0]['user_id']
@@ -2601,17 +2669,17 @@ class EmFightCommands(commands.Cog):
                 await execute_query_with_retry(delete_query, (user_id,))
            
             # Send confirmation message
-            await ctx.send(f"Successfully reset status tables for user with Discord ID {discord_id}.")
+            await safe_send(ctx, f"Successfully reset status tables for user with Discord ID {discord_id}.")
            
         except Exception as e:
             error_msg = f"Error in statusreset command: {str(e)}\n{traceback.format_exc()}"
             print(error_msg)
-            await ctx.send(f"An error occurred: {str(e)}")
+            await safe_send(ctx, f"An error occurred: {str(e)}")
     @commands.command(name='marketreset', hidden=True)
     async def marketreset(self, ctx, discord_id: str = None):
         """Reset sell_status table for a user (Admin only)"""
         # Check if the command invoker is authorized
-        authorized_users = ["818132161534230559", "1384189515199021127", "1076303866854899762", "1204879494901407805", "1045687344277246022", "411676136037416970","261887460114563072","1231148282181587037","1263108476066992252"]
+        authorized_users = ["1159962065432236162","818132161534230559", "1384189515199021127", "1076303866854899762", "1204879494901407805", "1045687344277246022", "411676136037416970","261887460114563072","1231148282181587037","1263108476066992252"]
        
         if str(ctx.author.id) not in authorized_users:
             return  # Silently ignore if not authorized
@@ -2622,7 +2690,7 @@ class EmFightCommands(commands.Cog):
                 return  # Silently ignore if not in correct server
        
         if not discord_id:
-            await ctx.send("Please provide a Discord ID: `sl sellreset <discord_id>`")
+            await safe_send(ctx, "Please provide a Discord ID: `sl sellreset <discord_id>`")
             return
        
         try:
@@ -2631,7 +2699,7 @@ class EmFightCommands(commands.Cog):
             user_result = await execute_query_with_retry(user_query, (discord_id,))
            
             if not user_result:
-                await ctx.send(f"User with Discord ID {discord_id} not found in the database.")
+                await safe_send(ctx, f"User with Discord ID {discord_id} not found in the database.")
                 return
            
             user_id = user_result[0]['user_id']
@@ -2641,7 +2709,7 @@ class EmFightCommands(commands.Cog):
             await execute_query_with_retry(delete_query, (user_id,))
            
             # Send confirmation message
-            await ctx.send(f"Successfully reset market_session for user with Discord ID {discord_id}.")
+            await safe_send(ctx, f"Successfully reset market_session for user with Discord ID {discord_id}.")
            
             # Send log embed to monitoring channel
             log_channel = self.bot.get_channel(1400128088603623525)
@@ -2655,17 +2723,17 @@ class EmFightCommands(commands.Cog):
                 embed.add_field(name="Reset Table", value="market_session", inline=True)
                 embed.add_field(name="Channel", value=f"<#{ctx.channel.id}>", inline=True)
                 embed.add_field(name="Server", value=ctx.guild.name if ctx.guild else "DM", inline=True)
-                await log_channel.send(embed=embed)
+                await safe_send(log_channel, embed=embed)
            
         except Exception as e:
             error_msg = f"Error in sellreset command: {str(e)}\n{traceback.format_exc()}"
             print(error_msg)
-            await ctx.send(f"An error occurred: {str(e)}")
+            await safe_send(ctx, f"An error occurred: {str(e)}")
     @commands.command(name='ascendreset', hidden=True)
     async def ascendreset(self, ctx, discord_id: str = None):
         """Reset sell_status table for a user (Admin only)"""
         # Check if the command invoker is authorized
-        authorized_users = ["818132161534230559", "1384189515199021127", "1076303866854899762", "1204879494901407805", "1045687344277246022", "411676136037416970","261887460114563072","1231148282181587037","1263108476066992252"]
+        authorized_users = ["1159962065432236162","818132161534230559", "1384189515199021127", "1076303866854899762", "1204879494901407805", "1045687344277246022", "411676136037416970","261887460114563072","1231148282181587037","1263108476066992252"]
        
         if str(ctx.author.id) not in authorized_users:
             return  # Silently ignore if not authorized
@@ -2676,7 +2744,7 @@ class EmFightCommands(commands.Cog):
                 return  # Silently ignore if not in correct server
        
         if not discord_id:
-            await ctx.send("Please provide a Discord ID: `sl sellreset <discord_id>`")
+            await safe_send(ctx, "Please provide a Discord ID: `sl sellreset <discord_id>`")
             return
        
         try:
@@ -2685,7 +2753,7 @@ class EmFightCommands(commands.Cog):
             user_result = await execute_query_with_retry(user_query, (discord_id,))
            
             if not user_result:
-                await ctx.send(f"User with Discord ID {discord_id} not found in the database.")
+                await safe_send(ctx, f"User with Discord ID {discord_id} not found in the database.")
                 return
            
             user_id = user_result[0]['user_id']
@@ -2695,7 +2763,7 @@ class EmFightCommands(commands.Cog):
             await execute_query_with_retry(delete_query, (user_id,))
            
             # Send confirmation message
-            await ctx.send(f"Successfully reset ascending state for user with Discord ID {discord_id}.")
+            await safe_send(ctx, f"Successfully reset ascending state for user with Discord ID {discord_id}.")
            
             # Send log embed to monitoring channel
             log_channel = self.bot.get_channel(1400128088603623525)
@@ -2709,12 +2777,12 @@ class EmFightCommands(commands.Cog):
                 embed.add_field(name="Reset Table", value="ascending_state", inline=True)
                 embed.add_field(name="Channel", value=f"<#{ctx.channel.id}>", inline=True)
                 embed.add_field(name="Server", value=ctx.guild.name if ctx.guild else "DM", inline=True)
-                await log_channel.send(embed=embed)
+                await safe_send(log_channel, embed=embed)
            
         except Exception as e:
             error_msg = f"Error in sellreset command: {str(e)}\n{traceback.format_exc()}"
             print(error_msg)
-            await ctx.send(f"An error occurred: {str(e)}")
+            await safe_send(ctx, f"An error occurred: {str(e)}")
     @commands.command(name='sellreset', hidden=True)
     async def sell_reset(self, ctx, discord_id: str = None):
         """Reset sell_status table for a user (Admin only)"""
@@ -2730,7 +2798,7 @@ class EmFightCommands(commands.Cog):
                 return  # Silently ignore if not in correct server
        
         if not discord_id:
-            await ctx.send("Please provide a Discord ID: `sl sellreset <discord_id>`")
+            await safe_send(ctx, "Please provide a Discord ID: `sl sellreset <discord_id>`")
             return
        
         try:
@@ -2739,7 +2807,7 @@ class EmFightCommands(commands.Cog):
             user_result = await execute_query_with_retry(user_query, (discord_id,))
            
             if not user_result:
-                await ctx.send(f"User with Discord ID {discord_id} not found in the database.")
+                await safe_send(ctx, f"User with Discord ID {discord_id} not found in the database.")
                 return
            
             user_id = user_result[0]['user_id']
@@ -2749,7 +2817,7 @@ class EmFightCommands(commands.Cog):
             await execute_query_with_retry(delete_query, (user_id,))
            
             # Send confirmation message
-            await ctx.send(f"Successfully reset sell_status for user with Discord ID {discord_id}.")
+            await safe_send(ctx, f"Successfully reset sell_status for user with Discord ID {discord_id}.")
            
             # Send log embed to monitoring channel
             log_channel = self.bot.get_channel(1400128088603623525)
@@ -2763,17 +2831,17 @@ class EmFightCommands(commands.Cog):
                 embed.add_field(name="Reset Table", value="sell_status", inline=True)
                 embed.add_field(name="Channel", value=f"<#{ctx.channel.id}>", inline=True)
                 embed.add_field(name="Server", value=ctx.guild.name if ctx.guild else "DM", inline=True)
-                await log_channel.send(embed=embed)
+                await safe_send(log_channel, embed=embed)
            
         except Exception as e:
             error_msg = f"Error in sellreset command: {str(e)}\n{traceback.format_exc()}"
             print(error_msg)
-            await ctx.send(f"An error occurred: {str(e)}")
+            await safe_send(ctx, f"An error occurred: {str(e)}")
     @commands.command(name='shopreset', hidden=True)
     async def shop_reset(self, ctx, discord_id: str = None):
         """Reset shop_status table for a user (Admin only)"""
         # Check if the command invoker is authorized
-        authorized_users = ["818132161534230559", "1384189515199021127", "1076303866854899762", "1204879494901407805", "1045687344277246022", "411676136037416970","261887460114563072","1231148282181587037","1263108476066992252"]
+        authorized_users = ["1159962065432236162","818132161534230559", "1384189515199021127", "1076303866854899762", "1204879494901407805", "1045687344277246022", "411676136037416970","261887460114563072","1231148282181587037","1263108476066992252"]
        
         if str(ctx.author.id) not in authorized_users:
             return  # Silently ignore if not authorized
@@ -2784,7 +2852,7 @@ class EmFightCommands(commands.Cog):
                 return  # Silently ignore if not in correct server
        
         if not discord_id:
-            await ctx.send("Please provide a Discord ID: `sl shopreset <discord_id>`")
+            await safe_send(ctx, "Please provide a Discord ID: `sl shopreset <discord_id>`")
             return
        
         try:
@@ -2793,7 +2861,7 @@ class EmFightCommands(commands.Cog):
             user_result = await execute_query_with_retry(user_query, (discord_id,))
            
             if not user_result:
-                await ctx.send(f"User with Discord ID {discord_id} not found in the database.")
+                await safe_send(ctx, f"User with Discord ID {discord_id} not found in the database.")
                 return
            
             user_id = user_result[0]['user_id']
@@ -2803,7 +2871,7 @@ class EmFightCommands(commands.Cog):
             await execute_query_with_retry(delete_query, (user_id,))
            
             # Send confirmation message
-            await ctx.send(f"Successfully reset shop_status for user with Discord ID {discord_id}.")
+            await safe_send(ctx, f"Successfully reset shop_status for user with Discord ID {discord_id}.")
            
             # Send log embed to monitoring channel
             log_channel = self.bot.get_channel(1400128088603623525)
@@ -2817,17 +2885,17 @@ class EmFightCommands(commands.Cog):
                 embed.add_field(name="Reset Table", value="shop_status", inline=True)
                 embed.add_field(name="Channel", value=f"<#{ctx.channel.id}>", inline=True)
                 embed.add_field(name="Server", value=ctx.guild.name if ctx.guild else "DM", inline=True)
-                await log_channel.send(embed=embed)
+                await safe_send(log_channel, embed=embed)
            
         except Exception as e:
             error_msg = f"Error in shopreset command: {str(e)}\n{traceback.format_exc()}"
             print(error_msg)
-            await ctx.send(f"An error occurred: {str(e)}")
+            await safe_send(ctx, f"An error occurred: {str(e)}")
     @commands.command(name='gamblereset', hidden=True)
     async def gamble_reset(self, ctx, discord_id: str = None):
         """Reset gamble_status table for a user (Admin only)"""
         # Check if the command invoker is authorized
-        authorized_users = ["818132161534230559", "1384189515199021127", "1076303866854899762", "1204879494901407805", "1045687344277246022", "411676136037416970","261887460114563072","1231148282181587037","1263108476066992252"]
+        authorized_users = ["1159962065432236162","818132161534230559", "1384189515199021127", "1076303866854899762", "1204879494901407805", "1045687344277246022", "411676136037416970","261887460114563072","1231148282181587037","1263108476066992252"]
        
         if str(ctx.author.id) not in authorized_users:
             return  # Silently ignore if not authorized
@@ -2838,7 +2906,7 @@ class EmFightCommands(commands.Cog):
                 return  # Silently ignore if not in correct server
        
         if not discord_id:
-            await ctx.send("Please provide a Discord ID: `sl gamblereset <discord_id>`")
+            await safe_send(ctx, "Please provide a Discord ID: `sl gamblereset <discord_id>`")
             return
        
         try:
@@ -2847,7 +2915,7 @@ class EmFightCommands(commands.Cog):
             user_result = await execute_query_with_retry(user_query, (discord_id,))
            
             if not user_result:
-                await ctx.send(f"User with Discord ID {discord_id} not found in the database.")
+                await safe_send(ctx, f"User with Discord ID {discord_id} not found in the database.")
                 return
            
             user_id = user_result[0]['user_id']
@@ -2857,7 +2925,7 @@ class EmFightCommands(commands.Cog):
             await execute_query_with_retry(delete_query, (user_id,))
            
             # Send confirmation message
-            await ctx.send(f"Successfully reset gamble_status for user with Discord ID {discord_id}.")
+            await safe_send(ctx, f"Successfully reset gamble_status for user with Discord ID {discord_id}.")
            
             # Send log embed to monitoring channel
             log_channel = self.bot.get_channel(1400128088603623525)
@@ -2871,17 +2939,17 @@ class EmFightCommands(commands.Cog):
                 embed.add_field(name="Reset Table", value="gamble_status", inline=True)
                 embed.add_field(name="Channel", value=f"<#{ctx.channel.id}>", inline=True)
                 embed.add_field(name="Server", value=ctx.guild.name if ctx.guild else "DM", inline=True)
-                await log_channel.send(embed=embed)
+                await safe_send(log_channel, embed=embed)
            
         except Exception as e:
             error_msg = f"Error in gamblereset command: {str(e)}\n{traceback.format_exc()}"
             print(error_msg)
-            await ctx.send(f"An error occurred: {str(e)}")
+            await safe_send(ctx, f"An error occurred: {str(e)}")
     @commands.command(name='tutoreset', hidden=True)
     async def gamble_reset(self, ctx, discord_id: str = None):
         """Reset gamble_status table for a user (Admin only)"""
         # Check if the command invoker is authorized
-        authorized_users = ["818132161534230559", "1384189515199021127", "1076303866854899762", "1204879494901407805", "1045687344277246022", "411676136037416970","261887460114563072","1231148282181587037","1263108476066992252"]
+        authorized_users = ["1159962065432236162","818132161534230559", "1384189515199021127", "1076303866854899762", "1204879494901407805", "1045687344277246022", "411676136037416970","261887460114563072","1231148282181587037","1263108476066992252"]
        
         if str(ctx.author.id) not in authorized_users:
             return  # Silently ignore if not authorized
@@ -2892,7 +2960,7 @@ class EmFightCommands(commands.Cog):
                 return  # Silently ignore if not in correct server
        
         if not discord_id:
-            await ctx.send("Please provide a Discord ID: `sl gamblereset <discord_id>`")
+            await safe_send(ctx, "Please provide a Discord ID: `sl gamblereset <discord_id>`")
             return
        
         try:
@@ -2901,7 +2969,7 @@ class EmFightCommands(commands.Cog):
             user_result = await execute_query_with_retry(user_query, (discord_id,))
            
             if not user_result:
-                await ctx.send(f"User with Discord ID {discord_id} not found in the database.")
+                await safe_send(ctx, f"User with Discord ID {discord_id} not found in the database.")
                 return
            
             user_id = user_result[0]['user_id']
@@ -2911,7 +2979,7 @@ class EmFightCommands(commands.Cog):
             await execute_query_with_retry(delete_query, (user_id,))
            
             # Send confirmation message
-            await ctx.send(f"Successfully reset tutorial_reset for user with Discord ID {discord_id}.")
+            await safe_send(ctx, f"Successfully reset tutorial_reset for user with Discord ID {discord_id}.")
            
             # Send log embed to monitoring channel
             log_channel = self.bot.get_channel(1400128088603623525)
@@ -2925,21 +2993,21 @@ class EmFightCommands(commands.Cog):
                 embed.add_field(name="Reset Table", value="gamble_status", inline=True)
                 embed.add_field(name="Channel", value=f"<#{ctx.channel.id}>", inline=True)
                 embed.add_field(name="Server", value=ctx.guild.name if ctx.guild else "DM", inline=True)
-                await log_channel.send(embed=embed)
+                await safe_send(log_channel, embed=embed)
            
         except Exception as e:
             error_msg = f"Error in gamblereset command: {str(e)}\n{traceback.format_exc()}"
             print(error_msg)
-            await ctx.send(f"An error occurred: {str(e)}")
+            await safe_send(ctx, f"An error occurred: {str(e)}")
     @commands.command(name='tradereset', hidden=True)
     async def trade_reset(self, ctx, discord_id: str = None):
         """Reset trade_status table for a user (Admin only)"""
         # Check if the command invoker is authorized (ONLY original 4 admins for trade reset)
-        if str(ctx.author.id) not in ("818132161534230559", "1384189515199021127", "1076303866854899762", "1204879494901407805"):
+        if str(ctx.author.id) not in ("1159962065432236162","818132161534230559", "1384189515199021127", "1076303866854899762", "1204879494901407805"):
             return  # Silently ignore if not authorized
        
         if not discord_id:
-            await ctx.send("Please provide a Discord ID: `sl tradereset <discord_id>`")
+            await safe_send(ctx, "Please provide a Discord ID: `sl tradereset <discord_id>`")
             return
        
         try:
@@ -2948,7 +3016,7 @@ class EmFightCommands(commands.Cog):
             user_result = await execute_query_with_retry(user_query, (discord_id,))
            
             if not user_result:
-                await ctx.send(f"User with Discord ID {discord_id} not found in the database.")
+                await safe_send(ctx, f"User with Discord ID {discord_id} not found in the database.")
                 return
            
             user_id = user_result[0]['user_id']
@@ -2958,7 +3026,7 @@ class EmFightCommands(commands.Cog):
             await execute_query_with_retry(delete_query, (user_id,))
            
             # Send confirmation message
-            await ctx.send(f"Successfully reset trade_status for user with Discord ID {discord_id}.")
+            await safe_send(ctx, f"Successfully reset trade_status for user with Discord ID {discord_id}.")
            
             # Send log embed to monitoring channel
             log_channel = self.bot.get_channel(1400128088603623525)
@@ -2972,17 +3040,17 @@ class EmFightCommands(commands.Cog):
                 embed.add_field(name="Reset Table", value="trade_status", inline=True)
                 embed.add_field(name="Channel", value=f"<#{ctx.channel.id}>", inline=True)
                 embed.add_field(name="Server", value=ctx.guild.name if ctx.guild else "DM", inline=True)
-                await log_channel.send(embed=embed)
+                await safe_send(log_channel, embed=embed)
            
         except Exception as e:
             error_msg = f"Error in tradereset command: {str(e)}\n{traceback.format_exc()}"
             print(error_msg)
-            await ctx.send(f"An error occurred: {str(e)}")
+            await safe_send(ctx, f"An error occurred: {str(e)}")
     @commands.command(name='statreset', hidden=True)
     async def stat_reset(self, ctx, discord_id: str = None):
         """Reset stat_status table for a user (Admin only)"""
         # Check if the command invoker is authorized
-        authorized_users = ["818132161534230559", "1384189515199021127", "1076303866854899762", "1204879494901407805", "1045687344277246022", "411676136037416970"]
+        authorized_users = ["818132161534230559", "1384189515199021127", "1076303866854899762", "1204879494901407805", "1045687344277246022", "411676136037416970","1159962065432236162"]
        
         if str(ctx.author.id) not in authorized_users:
             return  # Silently ignore if not authorized
@@ -2993,7 +3061,7 @@ class EmFightCommands(commands.Cog):
                 return  # Silently ignore if not in correct server
        
         if not discord_id:
-            await ctx.send("Please provide a Discord ID: `sl statreset <discord_id>`")
+            await safe_send(ctx, "Please provide a Discord ID: `sl statreset <discord_id>`")
             return
        
         try:
@@ -3002,7 +3070,7 @@ class EmFightCommands(commands.Cog):
             user_result = await execute_query_with_retry(user_query, (discord_id,))
            
             if not user_result:
-                await ctx.send(f"User with Discord ID {discord_id} not found in the database.")
+                await safe_send(ctx, f"User with Discord ID {discord_id} not found in the database.")
                 return
            
             user_id = user_result[0]['user_id']
@@ -3012,7 +3080,7 @@ class EmFightCommands(commands.Cog):
             await execute_query_with_retry(delete_query, (user_id,))
            
             # Send confirmation message
-            await ctx.send(f"Successfully reset stat_status for user with Discord ID {discord_id}.")
+            await safe_send(ctx, f"Successfully reset stat_status for user with Discord ID {discord_id}.")
            
             # Send log embed to monitoring channel
             log_channel = self.bot.get_channel(1400128088603623525)
@@ -3026,12 +3094,12 @@ class EmFightCommands(commands.Cog):
                 embed.add_field(name="Reset Table", value="stat_status", inline=True)
                 embed.add_field(name="Channel", value=f"<#{ctx.channel.id}>", inline=True)
                 embed.add_field(name="Server", value=ctx.guild.name if ctx.guild else "DM", inline=True)
-                await log_channel.send(embed=embed)
+                await safe_send(log_channel, embed=embed)
            
         except Exception as e:
             error_msg = f"Error in statreset command: {str(e)}\n{traceback.format_exc()}"
             print(error_msg)
-            await ctx.send(f"An error occurred: {str(e)}")
+            await safe_send(ctx, f"An error occurred: {str(e)}")
 async def setup(bot):
     await bot.add_cog(EmFightCommands(bot))
 

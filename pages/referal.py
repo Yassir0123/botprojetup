@@ -6,6 +6,7 @@ import logging
 import time
 import asyncio
 from utils.database import execute_query_with_retry, get_metrics
+from utils.db_atomic import db_advisory_lock, db_transaction
 import functools
 
 def _tr(lang, en, ar, fr):
@@ -27,6 +28,209 @@ async def _get_lang(discord_user_id: int) -> int:
     except Exception:
         pass
     return 0
+
+
+async def _add_inventory_product(inventory_id: int, product_id: int, quantity: int):
+    rows = await execute_query_with_retry(
+        """
+        SELECT quantiter
+        FROM inventory_product
+        WHERE inventory_id = %s AND product_id = %s
+        FOR UPDATE
+        """,
+        (inventory_id, product_id)
+    )
+    if rows:
+        await execute_query_with_retry(
+            """
+            UPDATE inventory_product
+            SET quantiter = quantiter + %s
+            WHERE inventory_id = %s AND product_id = %s
+            """,
+            (quantity, inventory_id, product_id)
+        )
+    else:
+        await execute_query_with_retry(
+            """
+            INSERT INTO inventory_product (inventory_id, product_id, quantiter)
+            VALUES (%s, %s, %s)
+            """,
+            (inventory_id, product_id, quantity)
+        )
+
+
+async def _add_inventory_chest(inventory_id: int, chest_id: int, quantity: int):
+    rows = await execute_query_with_retry(
+        """
+        SELECT quantiter
+        FROM inventory_chest
+        WHERE inventory_id = %s AND chest_id = %s
+        FOR UPDATE
+        """,
+        (inventory_id, chest_id)
+    )
+    if rows:
+        await execute_query_with_retry(
+            """
+            UPDATE inventory_chest
+            SET quantiter = quantiter + %s
+            WHERE inventory_id = %s AND chest_id = %s
+            """,
+            (quantity, inventory_id, chest_id)
+        )
+    else:
+        await execute_query_with_retry(
+            """
+            INSERT INTO inventory_chest (inventory_id, chest_id, quantiter)
+            VALUES (%s, %s, %s)
+            """,
+            (inventory_id, chest_id, quantity)
+        )
+
+
+async def claim_referee_reward_atomic(user_id: int, reroll_quantity: int) -> str:
+    async with db_advisory_lock(f"slbot:referee_reward:{user_id}", timeout=5):
+        async with db_transaction():
+            rows = await execute_query_with_retry(
+                """
+                SELECT r.referee_claimed_reward, u.roll_total, u.c_dungeon_points
+                FROM referrals r
+                JOIN user u ON r.referee_id = u.user_id
+                WHERE r.referee_id = %s
+                FOR UPDATE
+                """,
+                (user_id,)
+            )
+            if not rows:
+                return "not_found"
+
+            referee_data = rows[0]
+            if referee_data.get('referee_claimed_reward', 0) == 1:
+                return "claimed"
+            if referee_data['roll_total'] < 500 or referee_data['c_dungeon_points'] <= 0:
+                return "requirements"
+
+            inventory_rows = await execute_query_with_retry(
+                "SELECT inventory_id FROM inventory WHERE user_id = %s FOR UPDATE",
+                (user_id,)
+            )
+            if not inventory_rows:
+                return "inventory_missing"
+
+            await _add_inventory_product(inventory_rows[0]['inventory_id'], 2, reroll_quantity)
+            await execute_query_with_retry(
+                "UPDATE referrals SET referee_claimed_reward = 1 WHERE referee_id = %s",
+                (user_id,)
+            )
+            return "ok"
+
+
+async def claim_referrer_reward_atomic(referrer_id: int, referee_id: int) -> str:
+    lock_key = f"slbot:referrer_reward:{referrer_id}:{referee_id}"
+    async with db_advisory_lock(lock_key, timeout=5):
+        async with db_transaction():
+            rows = await execute_query_with_retry(
+                """
+                SELECT status, referee_claimed
+                FROM referrals
+                WHERE referrer_id = %s AND referee_id = %s
+                FOR UPDATE
+                """,
+                (referrer_id, referee_id)
+            )
+            if not rows:
+                return "not_found"
+            if rows[0].get('referee_claimed', 0) == 1 or rows[0].get('status') == 'completed':
+                return "claimed"
+
+            inventory_rows = await execute_query_with_retry(
+                "SELECT inventory_id FROM inventory WHERE user_id = %s FOR UPDATE",
+                (referrer_id,)
+            )
+            if not inventory_rows:
+                return "inventory_missing"
+
+            inventory_id = inventory_rows[0]['inventory_id']
+            await execute_query_with_retry(
+                """
+                UPDATE referrals
+                SET status = 'completed', referee_claimed = 1, completed_at = %s
+                WHERE referrer_id = %s AND referee_id = %s
+                """,
+                (datetime.now(), referrer_id, referee_id)
+            )
+            await _add_inventory_product(inventory_id, 2, 2)
+            await _add_inventory_chest(inventory_id, 3, 1)
+            await execute_query_with_retry(
+                "UPDATE user SET won_currency = won_currency + 50000 WHERE user_id = %s",
+                (referrer_id,)
+            )
+            return "ok"
+
+
+async def confirm_referral_atomic(referrer_id: int, target_id: int) -> str:
+    first_id, second_id = sorted([referrer_id, target_id])
+    async with db_advisory_lock(f"slbot:referral_confirm:{first_id}:{second_id}", timeout=5):
+        async with db_transaction():
+            existing_ref = await execute_query_with_retry(
+                "SELECT referrer_id FROM referrals WHERE referee_id = %s FOR UPDATE",
+                (target_id,)
+            )
+            if existing_ref:
+                return "already_referred"
+
+            target_refs = await execute_query_with_retry(
+                "SELECT referee_id FROM referrals WHERE referrer_id = %s FOR UPDATE",
+                (target_id,)
+            )
+            if target_refs:
+                return "target_is_referrer"
+
+            await execute_query_with_retry(
+                """
+                INSERT INTO referrals (referrer_id, referee_id, status, created_at)
+                VALUES (%s, %s, 'pending', %s)
+                """,
+                (referrer_id, target_id, datetime.now())
+            )
+
+            active_rows = await execute_query_with_retry(
+                """
+                SELECT current_refed, max_refed
+                FROM activerefs
+                WHERE user_id = %s
+                FOR UPDATE
+                """,
+                (referrer_id,)
+            )
+            if not active_rows:
+                return "ok"
+
+            current_refs = active_rows[0]['current_refed']
+            max_refs = active_rows[0]['max_refed']
+            inventory_rows = await execute_query_with_retry(
+                "SELECT inventory_id FROM inventory WHERE user_id = %s FOR UPDATE",
+                (referrer_id,)
+            )
+            inventory_id = inventory_rows[0]['inventory_id'] if inventory_rows else None
+
+            if current_refs < max_refs:
+                await execute_query_with_retry(
+                    "UPDATE activerefs SET current_refed = current_refed + 1 WHERE user_id = %s",
+                    (referrer_id,)
+                )
+                if inventory_id and (current_refs + 1) % 5 == 0:
+                    await _add_inventory_product(inventory_id, 2, 2)
+                    await _add_inventory_chest(inventory_id, 3, 1)
+            elif inventory_id:
+                await _add_inventory_product(inventory_id, 2, 2)
+                await execute_query_with_retry(
+                    "UPDATE user SET won_currency = won_currency + 50000 WHERE user_id = %s",
+                    (referrer_id,)
+                )
+                await _add_inventory_chest(inventory_id, 3, 1)
+
+            return "ok"
 
 class ReferralCommands(commands.Cog):
     def __init__(self, bot):
@@ -446,58 +650,31 @@ class RefereeRewardView(discord.ui.View):
     @discord.ui.button(label="Claim Referee Reward", style=discord.ButtonStyle.success, emoji="🎁")
     async def claim_referee_reward(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
-            # Double-check requirements and claim status
-            check_query = """
-            SELECT r.referee_claimed_reward, u.roll_total, u.c_dungeon_points
-            FROM referrals r
-            JOIN user u ON r.referee_id = u.user_id
-            WHERE r.referee_id = %s
-            """
-            result = await execute_query_with_retry(check_query, (self.user_id,))
-            
-            if not result:
-                await interaction.response.send_message(_tr(self.lang, "Error: Referral record not found.", "خطأ: لم يتم العثور على سجل الإحالة.", "Erreur : enregistrement de parrainage introuvable."), ephemeral=True)
+            claim_status = await claim_referee_reward_atomic(self.user_id, 10)
+            if claim_status != "ok":
+                messages = {
+                    "not_found": "Error: Referral record not found.",
+                    "requirements": "Error: You haven't completed the referral requirements yet.",
+                    "claimed": "Error: You have already claimed your referee reward.",
+                    "inventory_missing": "Error: Inventory not found.",
+                }
+                await interaction.response.send_message(messages.get(claim_status, "Error: Unable to claim reward."), ephemeral=True)
                 return
-            
-            referee_data = result[0]
-            roll_total = referee_data['roll_total']
-            mid_dungeon = referee_data['c_dungeon_points']
-            already_claimed = referee_data.get('referee_claimed_reward', 0)
-            
-            # Verify requirements
-            if roll_total < 500 or mid_dungeon <= 0:
-                await interaction.response.send_message(_tr(self.lang, "Error: You haven't completed the referral requirements yet.", "خطأ: لم تكمل متطلبات الإحالة بعد.", "Erreur : vous n’avez pas encore rempli les conditions de parrainage."), ephemeral=True)
-                return
-            
-            if already_claimed == 1:
-                await interaction.response.send_message(_tr(self.lang, "Error: You have already claimed your referee reward.", "خطأ: لقد طالبت بمكافأتك بالفعل.", "Erreur : vous avez déjà réclamé votre récompense de filleul."), ephemeral=True)
-                return
-            
-            # Get inventory_id
-            inventory_query = "SELECT inventory_id FROM inventory WHERE user_id = %s"
-            inventory_results = await execute_query_with_retry(inventory_query, (self.user_id,))
-            
-            if not inventory_results:
-                await interaction.response.send_message(_tr(self.lang, "Error: Inventory not found.", "خطأ: لم يتم العثور على الجرد.", "Erreur : inventaire introuvable."), ephemeral=True)
-                return
-                
-            inventory_id = inventory_results[0]['inventory_id']
-            
-            # Add 10 rerolls (product_id = 2)
-            check_product_query = "SELECT quantiter FROM inventory_product WHERE inventory_id = %s AND product_id = 2"
-            product_results = await execute_query_with_retry(check_product_query, (inventory_id,))
-            
-            if product_results:
-                update_product_query = "UPDATE inventory_product SET quantiter = quantiter + 10 WHERE inventory_id = %s AND product_id = 2"
-                await execute_query_with_retry(update_product_query, (inventory_id,))
-            else:
-                insert_product_query = "INSERT INTO inventory_product (inventory_id, product_id, quantiter) VALUES (%s, 2, 10)"
-                await execute_query_with_retry(insert_product_query, (inventory_id,))
-            
-            # Mark as claimed
-            update_claim_query = "UPDATE referrals SET referee_claimed_reward = 1 WHERE referee_id = %s"
-            await execute_query_with_retry(update_claim_query, (self.user_id,))
-            
+
+            embed = discord.Embed(
+                title=_tr(self.lang, "🎉 Referee Reward Claimed!", "🎉 تم استلام مكافأة المُحال!", "🎉 Récompense de filleul réclamée !"),
+                description=_tr(self.lang, "You have successfully claimed your one-time referee completion reward!", "لقد طالبت بنجاح بمكافأتك لمرة واحدة لإكمال الإحالة!", "Vous avez réclamé avec succès votre récompense unique de filleul !"),
+                color=discord.Color.green()
+            )
+            embed.add_field(
+                name=_tr(self.lang, "Rewards Received", "المكافآت المستلمة", "Récompenses reçues"),
+                value=_tr(self.lang, "<:blue_dot:1311418123404181585> +10 <:reroll:1302672409278545940> Reset Rolls", "<:blue_dot:1311418123404181585> +10 <:reroll:1302672409278545940> إعادة رمية", "<:blue_dot:1311418123404181585> +10 <:reroll:1302672409278545940> Rerolls"),
+                inline=False
+            )
+            button.disabled = True
+            await interaction.response.edit_message(embed=embed, view=self)
+            return
+
             # Create success embed
             embed = discord.Embed(
                 title=_tr(self.lang, "🎉 Referee Reward Claimed!", "🎉 تم استلام مكافأة المُحال!", "🎉 Récompense de filleul réclamée !"),
@@ -555,58 +732,30 @@ class ReferralStatusView(discord.ui.View):
     async def claim_referee_reward(self, interaction: discord.Interaction):
         """Handle referee reward claiming"""
         try:
-            # Double-check requirements and claim status
-            check_query = """
-            SELECT r.referee_claimed_reward, u.roll_total, u.c_dungeon_points
-            FROM referrals r
-            JOIN user u ON r.referee_id = u.user_id
-            WHERE r.referee_id = %s
-            """
-            result = await execute_query_with_retry(check_query, (self.user_id,))
-            
-            if not result:
-                await interaction.response.send_message(_tr(self.lang, "Error: Referral record not found.", "خطأ: لم يتم العثور على سجل الإحالة.", "Erreur : enregistrement de parrainage introuvable."), ephemeral=True)
+            claim_status = await claim_referee_reward_atomic(self.user_id, 5)
+            if claim_status != "ok":
+                messages = {
+                    "not_found": "Error: Referral record not found.",
+                    "requirements": "Error: You haven't completed the referral requirements yet.",
+                    "claimed": "Error: You have already claimed your referee reward.",
+                    "inventory_missing": "Error: Inventory not found.",
+                }
+                await interaction.response.send_message(messages.get(claim_status, "Error: Unable to claim reward."), ephemeral=True)
                 return
-            
-            referee_data = result[0]
-            roll_total = referee_data['roll_total']
-            mid_dungeon = referee_data['c_dungeon_points']
-            already_claimed = referee_data.get('referee_claimed_reward', 0)
-            
-            # Verify requirements
-            if roll_total < 500 or mid_dungeon <= 0:
-                await interaction.response.send_message(_tr(self.lang, "Error: You haven't completed the referral requirements yet.", "خطأ: لم تكمل متطلبات الإحالة بعد.", "Erreur : vous n’avez pas encore rempli les conditions de parrainage."), ephemeral=True)
-                return
-            
-            if already_claimed == 1:
-                await interaction.response.send_message(_tr(self.lang, "Error: You have already claimed your referee reward.", "خطأ: لقد طالبت بمكافأتك بالفعل.", "Erreur : vous avez déjà réclamé votre récompense de filleul."), ephemeral=True)
-                return
-            
-            # Get inventory_id
-            inventory_query = "SELECT inventory_id FROM inventory WHERE user_id = %s"
-            inventory_results = await execute_query_with_retry(inventory_query, (self.user_id,))
-            
-            if not inventory_results:
-                await interaction.response.send_message(_tr(self.lang, "Error: Inventory not found.", "خطأ: لم يتم العثور على الجرد.", "Erreur : inventaire introuvable."), ephemeral=True)
-                return
-                
-            inventory_id = inventory_results[0]['inventory_id']
-            
-            # Add 5 rerolls (product_id = 2)
-            check_product_query = "SELECT quantiter FROM inventory_product WHERE inventory_id = %s AND product_id = 2"
-            product_results = await execute_query_with_retry(check_product_query, (inventory_id,))
-            
-            if product_results:
-                update_product_query = "UPDATE inventory_product SET quantiter = quantiter + 5 WHERE inventory_id = %s AND product_id = 2"
-                await execute_query_with_retry(update_product_query, (inventory_id,))
-            else:
-                insert_product_query = "INSERT INTO inventory_product (inventory_id, product_id, quantiter) VALUES (%s, 2, 5)"
-                await execute_query_with_retry(insert_product_query, (inventory_id,))
-            
-            # Mark as claimed
-            update_claim_query = "UPDATE referrals SET referee_claimed_reward = 1 WHERE referee_id = %s"
-            await execute_query_with_retry(update_claim_query, (self.user_id,))
-            
+
+            embed = discord.Embed(
+                title=_tr(self.lang, "🎉 Referee Reward Claimed!", "🎉 تم استلام مكافأة المُحال!", "🎉 Récompense de filleul réclamée !"),
+                description=_tr(self.lang, "You have successfully claimed your one-time referee completion reward!", "لقد طالبت بنجاح بمكافأتك لمرة واحدة لإكمال الإحالة!", "Vous avez réclamé avec succès votre récompense unique de filleul !"),
+                color=discord.Color.green()
+            )
+            embed.add_field(
+                name=_tr(self.lang, "Rewards Received", "المكافآت المستلمة", "Récompenses reçues"),
+                value=_tr(self.lang, "<:blue_dot:1311418123404181585> +5 <:reroll:1302672409278545940> Reset Rolls", "<:blue_dot:1311418123404181585> +5 <:reroll:1302672409278545940> إعادة رمية", "<:blue_dot:1311418123404181585> +5 <:reroll:1302672409278545940> Rerolls"),
+                inline=False
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
             # Create success embed
             embed = discord.Embed(
                 title=_tr(self.lang, "🎉 Referee Reward Claimed!", "🎉 تم استلام مكافأة المُحال!", "🎉 Récompense de filleul réclamée !"),
@@ -914,50 +1063,33 @@ class UserDetailView(discord.ui.View):
                 return
                 
             referee_id = referee_result[0]['referee_id']
-            
-            # Update referral status to completed and mark as claimed
-            update_referral_query = """
-            UPDATE referrals 
-            SET status = 'completed', referee_claimed = 1, completed_at = %s
-            WHERE referrer_id = %s AND referee_id = %s
-            """
-            await execute_query_with_retry(update_referral_query, (datetime.now(), self.user_id, referee_id))
-            
-            # Get referrer's inventory_id
-            inventory_query = "SELECT inventory_id FROM inventory WHERE user_id = %s"
-            inventory_results = await execute_query_with_retry(inventory_query, (self.user_id,))
-            
-            if not inventory_results:
-                await interaction.response.send_message(_tr(self.lang, "Error: Inventory not found.", "خطأ: لم يتم العثور على الجرد.", "Erreur : inventaire introuvable."), ephemeral=True)
+
+            claim_status = await claim_referrer_reward_atomic(self.user_id, referee_id)
+            if claim_status != "ok":
+                messages = {
+                    "not_found": "Error: Could not find referral record.",
+                    "claimed": "Error: These referral rewards have already been claimed.",
+                    "inventory_missing": "Error: Inventory not found.",
+                }
+                await interaction.response.send_message(messages.get(claim_status, "Error: Unable to claim reward."), ephemeral=True)
                 return
-                
-            inventory_id = inventory_results[0]['inventory_id']
-            
-            # Add 2 rerolls (product_id = 2)
-            check_product_query = "SELECT quantiter FROM inventory_product WHERE inventory_id = %s AND product_id = 2"
-            product_results = await execute_query_with_retry(check_product_query, (inventory_id,))
-            
-            if product_results:
-                update_product_query = "UPDATE inventory_product SET quantiter = quantiter + 2 WHERE inventory_id = %s AND product_id = 2"
-                await execute_query_with_retry(update_product_query, (inventory_id,))
-            else:
-                insert_product_query = "INSERT INTO inventory_product (inventory_id, product_id, quantiter) VALUES (%s, 2, 2)"
-                await execute_query_with_retry(insert_product_query, (inventory_id,))
-            
-            # Add 1 monarch chest (chest_id = 3)
-            check_chest_query = "SELECT quantiter FROM inventory_chest WHERE inventory_id = %s AND chest_id = 3"
-            chest_results = await execute_query_with_retry(check_chest_query, (inventory_id,))
-            
-            if chest_results:
-                update_chest_query = "UPDATE inventory_chest SET quantiter = quantiter + 1 WHERE inventory_id = %s AND chest_id = 3"
-                await execute_query_with_retry(update_chest_query, (inventory_id,))
-            else:
-                insert_chest_query = "INSERT INTO inventory_chest (inventory_id, chest_id, quantiter) VALUES (%s, 3, 1)"
-                await execute_query_with_retry(insert_chest_query, (inventory_id,))
-            
-            # Add 50,000 won currency
-            update_currency_query = "UPDATE user SET won_currency = won_currency + 50000 WHERE user_id = %s"
-            await execute_query_with_retry(update_currency_query, (self.user_id,))
+
+            embed = discord.Embed(
+                title=_tr(self.lang, "🎉 Referral Rewards Claimed!", "🎉 تم استلام مكافآت الإحالة!", "🎉 Récompenses de parrainage réclamées !"),
+                description=_tr(self.lang, "You have successfully claimed your referral completion rewards!", "لقد استلمت مكافآت إكمال الإحالة بنجاح!", "Vous avez réclamé vos récompenses de parrainage avec succès !"),
+                color=discord.Color.green()
+            )
+            embed.add_field(
+                name=_tr(self.lang, "Rewards Received", "المكافآت المستلمة", "Récompenses reçues"),
+                value=_tr(self.lang,
+                         "<:blue_dot:1311418123404181585> +1 <:mona:1309275864206278748> Monarch Chest\n<:blue_dot:1311418123404181585> +2 <:reroll:1302672409278545940> Reset Rolls\n<:blue_dot:1311418123404181585> +50,000 Won Currency",
+                         "<:blue_dot:1311418123404181585> +1 <:mona:1309275864206278748> صندوق المونارك\n<:blue_dot:1311418123404181585> +2 <:reroll:1302672409278545940> إعادة رمية\n<:blue_dot:1311418123404181585> +50,000 وون",
+                         "<:blue_dot:1311418123404181585> +1 <:mona:1309275864206278748> Coffre du Monarque\n<:blue_dot:1311418123404181585> +2 <:reroll:1302672409278545940> Rerolls\n<:blue_dot:1311418123404181585> +50 000 Won"),
+                inline=False
+            )
+            new_view = UserDetailView(self.user_id, self.original_user, self.referred_users, self.user_index, self.lang)
+            await interaction.response.edit_message(embed=embed, view=new_view)
+            return
             
             # Create success embed
             embed = discord.Embed(
@@ -1002,123 +1134,51 @@ class ReferralConfirmView(discord.ui.View):
         try:
             lang = await _get_lang(interaction.user.id)
 
-            # RECHECK: Ensure target is not already referred by someone
-            check_existing_ref_query = "SELECT referrer_id FROM referrals WHERE referee_id = %s"
-            existing_ref_result = await execute_query_with_retry(check_existing_ref_query, (self.target_user_id,))
-            
-            if existing_ref_result:
-                # Disable all buttons
+            confirm_status = await confirm_referral_atomic(self.referrer_user_id, self.target_user_id)
+            if confirm_status != "ok":
                 for item in self.children:
                     item.disabled = True
-                
-                embed = discord.Embed(
-                    title=_tr(lang, "❌ Referral Not Allowed", "❌ الإحالة غير مسموح بها", "❌ Parrainage non autorisé"),
-                    description=_tr(lang, "You are already referred by someone else and cannot accept another referral.", "أنت مُحال بالفعل من قبل شخص آخر ولا يمكنك قبول إحالة أخرى.", "Vous êtes déjà parrainé par quelqu’un d’autre et ne pouvez pas accepter un autre parrainage."),
-                    color=discord.Color.red()
-                )
-                await interaction.response.edit_message(embed=embed, view=self)
-                return
-            
-            # RECHECK: Ensure target has not referred someone else
-            check_target_refs_query = "SELECT referee_id FROM referrals WHERE referrer_id = %s"
-            target_refs_result = await execute_query_with_retry(check_target_refs_query, (self.target_user_id,))
-            
-            if target_refs_result:
-                # Disable all buttons
-                for item in self.children:
-                    item.disabled = True
-                
-                embed = discord.Embed(
-                    title=_tr(lang, "❌ Referral Not Allowed", "❌ الإحالة غير مسموح بها", "❌ Parrainage non autorisé"),
-                    description=_tr(lang, "You have already referred someone and cannot be referred by others.", "لقد قمت بالفعل بإحالة شخص ما ولا يمكنك أن تكون مُحالاً.", "Vous avez déjà parrainé quelqu’un et ne pouvez pas être parrainé."),
-                    color=discord.Color.red()
-                )
-                await interaction.response.edit_message(embed=embed, view=self)
-                return
-            
-            # Insert referral record
-            insert_referral_query = """
-            INSERT INTO referrals (referrer_id, referee_id, status, created_at) 
-            VALUES (%s, %s, 'pending', %s)
-            """
-            await execute_query_with_retry(insert_referral_query, (self.referrer_user_id, self.target_user_id, datetime.now()))
-            # Check referrer's current status in activerefs
-            check_active_query = "SELECT current_refed, max_refed FROM activerefs WHERE user_id = %s"
-            active_results = await execute_query_with_retry(check_active_query, (self.referrer_user_id,))
-            
-            if active_results:
-                current_refs = active_results[0]['current_refed']
-                max_refs = active_results[0]['max_refed']
-                
-                if current_refs < max_refs:
-                    # Increment referral count
-                    update_query = "UPDATE activerefs SET current_refed = current_refed + 1 WHERE user_id = %s"
-                    await execute_query_with_retry(update_query, (self.referrer_user_id,))
-                    curr = current_refs + 1
-                    if curr % 5 == 0:
-                        # Give special reward at every 5th referral
-                        inventory_query = "SELECT inventory_id FROM inventory WHERE user_id = %s"
-                        inventory_results = await execute_query_with_retry(inventory_query, (self.referrer_user_id,))
-                        
-                        if inventory_results:
-                            inventory_id = inventory_results[0]['inventory_id']
-                            
-                            # +2 rerolls (product_id = 2)
-                            check_product_query = "SELECT quantiter FROM inventory_product WHERE inventory_id = %s AND product_id = 2"
-                            product_results = await execute_query_with_retry(check_product_query, (inventory_id,))
-                            
-                            if product_results:
-                                update_product_query = "UPDATE inventory_product SET quantiter = quantiter + 2 WHERE inventory_id = %s AND product_id = 2"
-                                await execute_query_with_retry(update_product_query, (inventory_id,))
-                            else:
-                                insert_product_query = "INSERT INTO inventory_product (inventory_id, product_id, quantiter) VALUES (%s, 2, 2)"
-                                await execute_query_with_retry(insert_product_query, (inventory_id,))
-                                                         
-                            # +1 monarch chest (chest_id = 3)
-                            check_chest_query = "SELECT quantiter FROM inventory_chest WHERE inventory_id = %s AND chest_id = 3"
-                            chest_results = await execute_query_with_retry(check_chest_query, (inventory_id,))
-                            
-                            if chest_results:
-                                update_chest_query = "UPDATE inventory_chest SET quantiter = quantiter + 1 WHERE inventory_id = %s AND chest_id = 3"
-                                await execute_query_with_retry(update_chest_query, (inventory_id,))
-                            else:
-                                insert_chest_query = "INSERT INTO inventory_chest (inventory_id, chest_id, quantiter) VALUES (%s, 3, 1)"
-                                await execute_query_with_retry(insert_chest_query, (inventory_id,))
-                
+                if confirm_status == "already_referred":
+                    description = _tr(lang, "You are already referred by someone else and cannot accept another referral.", "أنت مُحال بالفعل من قبل شخص آخر ولا يمكنك قبول إحالة أخرى.", "Vous êtes déjà parrainé par quelqu’un d’autre et ne pouvez pas accepter un autre parrainage.")
+                elif confirm_status == "target_is_referrer":
+                    description = _tr(lang, "You have already referred someone and cannot be referred by others.", "لقد قمت بالفعل بإحالة شخص ما ولا يمكنك أن تكون مُحالاً.", "Vous avez déjà parrainé quelqu’un et ne pouvez pas être parrainé.")
                 else:
-                    # Beyond cap, give special rewards
-                    inventory_query = "SELECT inventory_id FROM inventory WHERE user_id = %s"
-                    inventory_results = await execute_query_with_retry(inventory_query, (self.referrer_user_id,))
-                    
-                    if inventory_results:
-                        inventory_id = inventory_results[0]['inventory_id']
-                        
-                        # +2 rerolls
-                        check_product_query = "SELECT quantiter FROM inventory_product WHERE inventory_id = %s AND product_id = 2"
-                        product_results = await execute_query_with_retry(check_product_query, (inventory_id,))
-                        
-                        if product_results:
-                            update_product_query = "UPDATE inventory_product SET quantiter = quantiter + 2 WHERE inventory_id = %s AND product_id = 2"
-                            await execute_query_with_retry(update_product_query, (inventory_id,))
-                        else:
-                            insert_product_query = "INSERT INTO inventory_product (inventory_id, product_id, quantiter) VALUES (%s, 2, 2)"
-                            await execute_query_with_retry(insert_product_query, (inventory_id,))
-                        
-                        # +50,000 won
-                        update_currency_query = "UPDATE user SET won_currency = won_currency + 50000 WHERE user_id = %s"
-                        await execute_query_with_retry(update_currency_query, (self.referrer_user_id,))
-                        
-                        # +1 monarch chest
-                        check_chest_query = "SELECT quantiter FROM inventory_chest WHERE inventory_id = %s AND chest_id = 3"
-                        chest_results = await execute_query_with_retry(check_chest_query, (inventory_id,))
-                        
-                        if chest_results:
-                            update_chest_query = "UPDATE inventory_chest SET quantiter = quantiter + 1 WHERE inventory_id = %s AND chest_id = 3"
-                            await execute_query_with_retry(update_chest_query, (inventory_id,))
-                        else:
-                            insert_chest_query = "INSERT INTO inventory_chest (inventory_id, chest_id, quantiter) VALUES (%s, 3, 1)"
-                            await execute_query_with_retry(insert_chest_query, (inventory_id,))
-            
+                    description = "Referral could not be confirmed."
+
+                embed = discord.Embed(
+                    title=_tr(lang, "❌ Referral Not Allowed", "❌ الإحالة غير مسموح بها", "❌ Parrainage non autorisé"),
+                    description=description,
+                    color=discord.Color.red()
+                )
+                await interaction.response.edit_message(embed=embed, view=self)
+                return
+
+            for item in self.children:
+                item.disabled = True
+
+            embed = discord.Embed(
+                title=_tr(lang, "🎉 Referral Confirmed!", "🎉 تم تأكيد الإحالة!", "🎉 Parrainage confirmé !"),
+                description=_tr(
+                    lang,
+                    f"You have successfully been referred by **{self.referrer_user.display_name}**!",
+                    f"لقد تم إحالتك بنجاح بواسطة **{self.referrer_user.display_name}**!",
+                    f"Vous avez été parrainé avec succès par **{self.referrer_user.display_name}** !"
+                ),
+                color=discord.Color.green()
+            )
+            embed.add_field(
+                name=_tr(lang, "What's Next?", "ما التالي؟", "Et ensuite ?"),
+                value=_tr(
+                    lang,
+                    "<:blue_dot:1311418123404181585> Complete 500 total rolls\n<:blue_dot:1311418123404181585> Clear at least 1 mid-level dungeon\n<:blue_dot:1311418123404181585> Once completed, your referrer will earn passive rewards from your activities!",
+                    "<:blue_dot:1311418123404181585> أكمل 500 رمية إجمالية\n<:blue_dot:1311418123404181585> أتمم على الأقل زنزانة واحدة متوسطة\n<:blue_dot:1311418123404181585> عند اكتمالها، سيحصل المُحيل على مكافآت سلبية من نشاطاتك!",
+                    "<:blue_dot:1311418123404181585> Atteignez 500 lancers au total\n<:blue_dot:1311418123404181585> Terminez au moins 1 donjon moyen\n<:blue_dot:1311418123404181585> Une fois fait, votre parrain gagnera des récompenses passives grâce à vos activités !"
+                ),
+                inline=False
+            )
+            await interaction.response.edit_message(embed=embed, view=self)
+            return
+
             # Disable all buttons
             for item in self.children:
                 item.disabled = True

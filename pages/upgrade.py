@@ -1,6 +1,7 @@
 import discord
 from discord.ext import commands
 from utils.database import create_db_connection
+from utils.activity_state import block_during_user_activity
 from mysql.connector import Error
 from asyncio import TimeoutError
 
@@ -25,6 +26,7 @@ class UpgradeCommands(commands.Cog):
             cursor.close()
 
     @commands.command(name="upgrade")
+    @block_during_user_activity()
     async def upgrade(self, ctx, *, card_name):
         if not card_name:
             await ctx.send("Please provide a card name to upgrade.")

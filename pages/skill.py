@@ -8,6 +8,7 @@ import asyncio
 import time
 import re
 from utils.database import execute_query_with_retry, get_metrics
+from utils.db_atomic import advisory_lock_for_context, db_transaction
 import functools
 
 # NOTE:
@@ -47,6 +48,7 @@ class SkillCommands(commands.Cog):
         self.COOLDOWN_TIME = 2  # Cooldown time in seconds
 
     @commands.command(name='sequip', aliases=["seq","ske"])
+    @advisory_lock_for_context("slbot:skill")
     async def skill_equip(self, ctx, *, args=None):
         """Equip a skill to a card (multilanguage)"""
         lang = await getlang(ctx.author.id)
@@ -256,28 +258,69 @@ class SkillCommands(commands.Cog):
         
         current_quantity = inventory_skill_result[0]["quantiter"]
         
-        # Equip the skill
-        equip_query = """
-        UPDATE user_cards 
-        SET skill_id = %s 
-        WHERE user_id = %s AND card_id = %s
-        """
-        await execute_query_with_retry(equip_query, (skill_id, user_id, user_card_id))
-        
-        # Update inventory
-        if current_quantity == 1:
-            delete_query = """
-            DELETE FROM inventory_skills 
-            WHERE inventory_id = %s AND skill_id = %s
-            """
-            await execute_query_with_retry(delete_query, (inventory_id, skill_id))
-        else:
-            update_query = """
-            UPDATE inventory_skills 
-            SET quantiter = quantiter - 1 
-            WHERE inventory_id = %s AND skill_id = %s
-            """
-            await execute_query_with_retry(update_query, (inventory_id, skill_id))
+        async with db_transaction():
+            locked_card = await execute_query_with_retry(
+                """
+                SELECT skill_id
+                FROM user_cards
+                WHERE user_id = %s AND card_id = %s
+                FOR UPDATE
+                """,
+                (user_id, user_card_id)
+            )
+            if not locked_card or locked_card[0]["skill_id"] != 0:
+                await ctx.send(_tr(
+                    lang,
+                    "❌ Your card already has a skill equipped! Please unequip it first.",
+                    "❌ بطاقتك لديها مهارة مجهزة بالفعل! يرجى إزالة تجهيزها أولاً.",
+                    "❌ Votre carte a déjà une compétence équipée ! Veuillez d'abord la déséquiper."
+                ))
+                return
+
+            locked_skill = await execute_query_with_retry(
+                """
+                SELECT quantiter
+                FROM inventory_skills
+                WHERE inventory_id = %s AND skill_id = %s
+                FOR UPDATE
+                """,
+                (inventory_id, skill_id)
+            )
+            if not locked_skill or locked_skill[0]["quantiter"] <= 0:
+                await ctx.send(_tr(
+                    lang,
+                    f"❌ You don't have the skill '{found_skill_name}' in your inventory!",
+                    f"❌ لا تملك المهارة '{found_skill_name}' في مخزونك!",
+                    f"❌ Vous n'avez pas la compétence '{found_skill_name}' dans votre inventaire !"
+                ))
+                return
+
+            await execute_query_with_retry(
+                """
+                UPDATE user_cards
+                SET skill_id = %s
+                WHERE user_id = %s AND card_id = %s
+                """,
+                (skill_id, user_id, user_card_id)
+            )
+
+            if locked_skill[0]["quantiter"] == 1:
+                await execute_query_with_retry(
+                    """
+                    DELETE FROM inventory_skills
+                    WHERE inventory_id = %s AND skill_id = %s
+                    """,
+                    (inventory_id, skill_id)
+                )
+            else:
+                await execute_query_with_retry(
+                    """
+                    UPDATE inventory_skills
+                    SET quantiter = quantiter - 1
+                    WHERE inventory_id = %s AND skill_id = %s
+                    """,
+                    (inventory_id, skill_id)
+                )
 
         await ctx.send(_tr(
             lang,
@@ -287,6 +330,7 @@ class SkillCommands(commands.Cog):
         ))
 
     @commands.command(name='sunequip', aliases=["sq","sku"])
+    @advisory_lock_for_context("slbot:skill")
     async def skill_unequip(self, ctx, *, args=None):
         """Unequip a skill from a card (multilanguage)"""
         lang = await getlang(ctx.author.id)
@@ -454,37 +498,61 @@ class SkillCommands(commands.Cog):
             ))
             return
         
-        # Check if skill exists in inventory
-        inventory_skill_query = """
-        SELECT quantiter 
-        FROM inventory_skills 
-        WHERE inventory_id = %s AND skill_id = %s
-        """
-        inventory_skill_result = await execute_query_with_retry(inventory_skill_query, (inventory_id, skill_id))
-        
-        if not inventory_skill_result:
-            # Insert new row with quantity 1
-            insert_query = """
-            INSERT INTO inventory_skills (inventory_id, skill_id, quantiter) 
-            VALUES (%s, %s, 1)
-            """
-            await execute_query_with_retry(insert_query, (inventory_id, skill_id))
-        else:
-            # Update quantity by adding 1
-            update_query = """
-            UPDATE inventory_skills 
-            SET quantiter = quantiter + 1 
-            WHERE inventory_id = %s AND skill_id = %s
-            """
-            await execute_query_with_retry(update_query, (inventory_id, skill_id))
-        
-        # Unequip the skill (set to 0)
-        unequip_query = """
-        UPDATE user_cards 
-        SET skill_id = 0 
-        WHERE user_id = %s AND card_id = %s
-        """
-        await execute_query_with_retry(unequip_query, (user_id, user_card_id))
+        async with db_transaction():
+            locked_card = await execute_query_with_retry(
+                """
+                SELECT skill_id
+                FROM user_cards
+                WHERE user_id = %s AND card_id = %s
+                FOR UPDATE
+                """,
+                (user_id, user_card_id)
+            )
+            if not locked_card or locked_card[0]["skill_id"] != skill_id:
+                await ctx.send(_tr(
+                    lang,
+                    f"❌ Your card doesn't have the skill '{found_skill_name}' equipped!",
+                    f"❌ بطاقتك لا تحتوي على المهارة '{found_skill_name}' مجهزة!",
+                    f"❌ Votre carte n'a pas la compétence '{found_skill_name}' équipée !"
+                ))
+                return
+
+            inventory_skill_result = await execute_query_with_retry(
+                """
+                SELECT quantiter
+                FROM inventory_skills
+                WHERE inventory_id = %s AND skill_id = %s
+                FOR UPDATE
+                """,
+                (inventory_id, skill_id)
+            )
+
+            if not inventory_skill_result:
+                await execute_query_with_retry(
+                    """
+                    INSERT INTO inventory_skills (inventory_id, skill_id, quantiter)
+                    VALUES (%s, %s, 1)
+                    """,
+                    (inventory_id, skill_id)
+                )
+            else:
+                await execute_query_with_retry(
+                    """
+                    UPDATE inventory_skills
+                    SET quantiter = quantiter + 1
+                    WHERE inventory_id = %s AND skill_id = %s
+                    """,
+                    (inventory_id, skill_id)
+                )
+
+            await execute_query_with_retry(
+                """
+                UPDATE user_cards
+                SET skill_id = 0
+                WHERE user_id = %s AND card_id = %s
+                """,
+                (user_id, user_card_id)
+            )
 
         await ctx.send(_tr(
             lang,

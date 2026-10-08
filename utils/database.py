@@ -6,6 +6,21 @@ from typing import Optional, Union, List, Dict, Any, Tuple
 from config import DB_CONFIG
 import functools
 import uuid
+import contextvars
+
+_transaction_cursor = contextvars.ContextVar("transaction_cursor", default=None)
+
+
+def set_transaction_cursor(cursor):
+    return _transaction_cursor.set(cursor)
+
+
+def reset_transaction_cursor(token):
+    _transaction_cursor.reset(token)
+
+
+def get_transaction_cursor():
+    return _transaction_cursor.get()
 
 class ConnectionMetrics:
     """Class to track database connection metrics"""
@@ -93,12 +108,11 @@ class CommandLockRegistry:
         while True:
             await asyncio.sleep(300)  # Run every 5 minutes
             async with self.lock_creation:
-                # We can't easily determine if a lock is still in use
-                # So we'll just keep the registry size reasonable
                 if len(self.locks) > 10000:
-                    # If we have too many locks, clear half of them
-                    # This is a simple approach - in production you might want something more sophisticated
-                    keys_to_remove = list(self.locks.keys())[:5000]
+                    keys_to_remove = [
+                        key for key, lock in self.locks.items()
+                        if not lock.locked()
+                    ][:5000]
                     for key in keys_to_remove:
                         del self.locks[key]
 
@@ -134,6 +148,7 @@ class DatabaseManager:
         self._connection_semaphore = asyncio.Semaphore(80)  # Limit concurrent connections to 80% of pool max
         self._query_queue = asyncio.Queue()  # Queue for handling query backpressure
         self._query_workers = []  # Worker tasks for processing queries
+        self._checked_out_connection_ids = set()
         
         # Start the pool initialization immediately
         asyncio.create_task(self._initialize_pool())
@@ -192,14 +207,16 @@ class DatabaseManager:
     
     def _start_query_workers(self):
         """Start worker tasks to process queries from the queue"""
-        # Create 5 worker tasks
-        for _ in range(5):
+        self._query_workers = [worker for worker in self._query_workers if not worker.done()]
+        target_workers = 5
+        for _ in range(max(0, target_workers - len(self._query_workers))):
             worker = asyncio.create_task(self._query_worker())
             self._query_workers.append(worker)
     
     async def _query_worker(self):
         """Worker that processes queries from the queue"""
         while True:
+            query_task = None
             try:
                 # Get the next query from the queue
                 query_task = await self._query_queue.get()
@@ -210,13 +227,15 @@ class DatabaseManager:
                 except Exception as e:
                     print(f"Error executing queued query: {e}")
                 
-                # Mark the task as done
-                self._query_queue.task_done()
-                
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 print(f"Error in query worker: {e}")
                 # Sleep briefly to avoid tight loop if there's a persistent error
                 await asyncio.sleep(0.1)
+            finally:
+                if query_task is not None:
+                    self._query_queue.task_done()
     
     async def _delayed_retry_init(self):
         """Retry pool initialization after a delay"""
@@ -235,6 +254,8 @@ class DatabaseManager:
             # Get connections in parallel
             tasks = [self._warm_single_connection() for _ in range(warm_count)]
             self._warm_connections = await asyncio.gather(*tasks)
+            for _ in self._warm_connections:
+                self.metrics.record_connection_released()
             
             warm_time = time.time() - start_time
             print(f"Pre-warmed {len(self._warm_connections)} connections in {warm_time:.2f}s")
@@ -267,10 +288,10 @@ class DatabaseManager:
                         # Release one warm connection
                         conn = self._warm_connections.pop(0)
                         self._pool.release(conn)
-                        self.metrics.record_connection_released()
                         
                         # Acquire a new one
                         new_conn = await self._warm_single_connection()
+                        self.metrics.record_connection_released()
                         self._warm_connections.append(new_conn)
                 else:
                     # If pool is closed, try to reinitialize it
@@ -301,33 +322,51 @@ class DatabaseManager:
             asyncio.create_task(self._initialize_pool())
             return None
         
-        # Use semaphore to limit concurrent connections
-        # This prevents too many connections from being acquired at once
-        async with self._connection_semaphore:
+        semaphore_acquired = False
+        try:
+            await self._connection_semaphore.acquire()
+            semaphore_acquired = True
+
             # Try to use a pre-warmed connection if available
             if self._warm_connections:
                 conn = self._warm_connections.pop(0)
+                self.metrics.record_connection_acquired()
+                self._checked_out_connection_ids.add(id(conn))
                 return conn
                 
             # Otherwise get a new connection from the pool
-            try:
-                conn = await self._pool.acquire()
-                self.metrics.record_connection_acquired()
-                return conn
-            except Exception as e:
-                self.metrics.record_error(e)
-                print(f"Error acquiring connection: {e}")
-                return None
+            conn = await self._pool.acquire()
+            self.metrics.record_connection_acquired()
+            self._checked_out_connection_ids.add(id(conn))
+            return conn
+        except Exception as e:
+            if semaphore_acquired:
+                self._connection_semaphore.release()
+            self.metrics.record_error(e)
+            print(f"Error acquiring connection: {e}")
+            return None
     
     async def release_connection(self, conn):
         """Release a connection back to the pool"""
-        if conn and self._pool and not self._pool._closed:
-            # If we have fewer than our target warm connections, keep this one warm
-            if len(self._warm_connections) < 5 and len(self._warm_connections) < self._pool.maxsize // 4:
-                self._warm_connections.append(conn)
-            else:
-                self._pool.release(conn)
-                self.metrics.record_connection_released()
+        if not conn:
+            return
+
+        checked_out = id(conn) in self._checked_out_connection_ids
+        if checked_out:
+            self._checked_out_connection_ids.discard(id(conn))
+
+        try:
+            if self._pool and not self._pool._closed:
+                # If we have fewer than our target warm connections, keep this one warm.
+                if len(self._warm_connections) < 5 and len(self._warm_connections) < self._pool.maxsize // 4:
+                    self._warm_connections.append(conn)
+                    self.metrics.record_connection_released()
+                else:
+                    self._pool.release(conn)
+                    self.metrics.record_connection_released()
+        finally:
+            if checked_out:
+                self._connection_semaphore.release()
     
     async def execute_query(self, query: str, params: Optional[tuple] = None) -> Union[List[Dict[str, Any]], None]:
         """Execute a query and return the results"""
@@ -335,6 +374,19 @@ class DatabaseManager:
         start_time = time.time()
         
         try:
+            active_cursor = get_transaction_cursor()
+            if active_cursor is not None:
+                await active_cursor.execute(query, params)
+                result = await active_cursor.fetchall()
+
+                query_time = (time.time() - start_time) * 1000
+                self.metrics.record_query_time(query_time)
+
+                if query_time > self.metrics.slow_query_threshold:
+                    print(f"Slow query ({query_time:.2f}ms): {query[:100]}...")
+
+                return list(result or [])
+
             conn = await self.get_connection()
             if not conn:
                 return None
@@ -355,6 +407,8 @@ class DatabaseManager:
         except Exception as e:
             self.metrics.record_error(e)
             print(f"Error executing query: {e}")
+            if get_transaction_cursor() is not None:
+                raise
             return None
         finally:
             if conn:
@@ -362,6 +416,9 @@ class DatabaseManager:
     
     async def execute_query_with_retry(self, query: str, params: Optional[tuple] = None, max_retries: int = 3) -> Union[List[Dict[str, Any]], None]:
         """Execute a query with automatic retry on failure"""
+        if get_transaction_cursor() is not None:
+            return await self.execute_query(query, params)
+
         # If this is the first query and pool isn't initialized yet, wait for it
         if not self._pool_initialized.is_set():
             try:

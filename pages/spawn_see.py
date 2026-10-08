@@ -11,6 +11,7 @@ from collections import deque
 from discord.ui import Button, View, Select
 import traceback
 from utils.database import execute_query_with_retry, get_metrics
+from utils.inventory_ops import add_inventory_quantity
 from PIL import Image, ImageDraw, ImageFont
 import io
 
@@ -4663,21 +4664,7 @@ ORDER BY FIELD(cr.cardrank_name, 'S', 'A', 'B', 'C', 'D','E')
 
                         if inventory_result:
                             inventory_id = inventory_result[0]['inventory_id']
-                            inv_frag_query = """SELECT * FROM inventory_frags
-                                WHERE inventory_id = %s AND frag_id = %s"""
-                            inv_frag_result = await execute_query_with_retry(inv_frag_query, (inventory_id, fragment_id))
-
-                            if inv_frag_result:
-                                await execute_query_with_retry("""
-                                    UPDATE inventory_frags
-                                    SET quantiter = quantiter + 1
-                                    WHERE inventory_id = %s AND frag_id = %s
-                                """, (inventory_id, fragment_id))
-                            else:
-                                await execute_query_with_retry("""
-                                    INSERT INTO inventory_frags (inventory_id, frag_id, quantiter)
-                                    VALUES (%s, %s, 1)
-                                """, (inventory_id, fragment_id))
+                            await add_inventory_quantity("inventory_frags", inventory_id, fragment_id, 1)
 
                             total_fragments_query = """
                                 SELECT SUM(quantiter) as total_fragments
@@ -5270,18 +5257,7 @@ ORDER BY FIELD(cr.cardrank_name, 'S', 'A', 'B', 'C', 'D','E')
                 # STEP 5: Batch update fragments
                 if fragment_updates and inventory_id:
                     for fragment_id, quantity in fragment_updates.items():
-                        check_query = "SELECT quantiter FROM inventory_frags WHERE inventory_id = %s AND frag_id = %s"
-                        check_result = await execute_query_with_retry(check_query, (inventory_id, fragment_id))
-                        if check_result:
-                            await execute_query_with_retry(
-                                "UPDATE inventory_frags SET quantiter = quantiter + %s WHERE inventory_id = %s AND frag_id = %s",
-                                (quantity, inventory_id, fragment_id)
-                            )
-                        else:
-                            await execute_query_with_retry(
-                                "INSERT INTO inventory_frags (inventory_id, frag_id, quantiter) VALUES (%s, %s, %s)",
-                                (inventory_id, fragment_id, quantity)
-                            )
+                        await add_inventory_quantity("inventory_frags", inventory_id, fragment_id, quantity)
                
                 # Final processing message
                 final_loading_embed = discord.Embed(
@@ -5496,23 +5472,7 @@ ORDER BY FIELD(cr.cardrank_name, 'S', 'A', 'B', 'C', 'D','E')
                     
                     if inventory_result:
                         error_inventory_id = inventory_result[0]['inventory_id']
-                        
-                        # Check if product_id=2 exists in inventory_product
-                        product_check_query = "SELECT quantiter FROM inventory_product WHERE inventory_id = %s AND product_id = 2"
-                        product_result = await execute_query_with_retry(product_check_query, (error_inventory_id,))
-                        
-                        if product_result:
-                            # Update existing row
-                            await execute_query_with_retry(
-                                "UPDATE inventory_product SET quantiter = quantiter + 1 WHERE inventory_id = %s AND product_id = 2",
-                                (error_inventory_id,)
-                            )
-                        else:
-                            # Insert new row
-                            await execute_query_with_retry(
-                                "INSERT INTO inventory_product (inventory_id, product_id, quantiter) VALUES (%s, 2, 1)",
-                                (error_inventory_id,)
-                            )
+                        await add_inventory_quantity("inventory_product", error_inventory_id, 2, 1)
             except Exception as compensation_error:
                 print(f"Error during compensation logic: {compensation_error}")
             
@@ -5824,28 +5784,7 @@ ORDER BY FIELD(cr.cardrank_name, 'S', 'A', 'B', 'C', 'D','E')
                    
                     if inventory_result:
                         inventory_id = inventory_result[0]['inventory_id']
-                       
-                        # Check if the user already has a chest with ID 1
-                        chest_query = """
-                            SELECT *
-                            FROM inventory_chest
-                            WHERE inventory_id = %s AND chest_id = 1
-                        """
-                        existing_chest = await execute_query_with_retry(chest_query, (inventory_id,))
-                       
-                        if existing_chest:
-                            # Update quantity if chest exists
-                            await execute_query_with_retry("""
-                                UPDATE inventory_chest
-                                SET quantiter = quantiter + 1
-                                WHERE inventory_id = %s AND chest_id = 1
-                            """, (inventory_id,))
-                        else:
-                            # Insert new chest entry if it doesn't exist
-                            await execute_query_with_retry("""
-                                INSERT INTO inventory_chest (inventory_id, chest_id, quantiter)
-                                VALUES (%s, 1, 1)
-                            """, (inventory_id,))
+                        await add_inventory_quantity("inventory_chest", inventory_id, 1, 1)
                    
                     print(f"User {user_id} completed the 'Pull 7 cards' quest and received a chest!")
        

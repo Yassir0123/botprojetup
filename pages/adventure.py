@@ -14,6 +14,11 @@ from datetime import datetime
 import json
 import time
 from utils.database import execute_query_with_retry, get_metrics
+from utils.activity_state import claim_user_activity, release_user_activity
+from utils.db_atomic import advisory_lock_for_context, db_transaction
+from utils.discord_safe import safe_defer, safe_edit, safe_remove_attachments, safe_send
+from utils.error_reporting import send_support_error
+from utils.inventory_ops import add_inventory_quantity
 
 import functools
 async def get_user_multilanguage(user_authorid: int) -> int:
@@ -59,7 +64,7 @@ def command_cooldown(rate=1, per=3.0, type=commands.BucketType.user):
                 if retry_after:
                     # Command is on cooldown
                     remaining = round(retry_after, 1)
-                    await ctx.send(f"⏰ Command on cooldown. Please wait {remaining} seconds.")
+                    await safe_send(ctx, f"⏰ Command on cooldown. Please wait {remaining} seconds.")
                     return
             else:
                 # Create a new cooldown bucket
@@ -109,7 +114,7 @@ class ChapterSelect(Select):
     def __init__(self, arcs: List[Dict], current_arc_id: int, lang: int):
         options = [
             discord.SelectOption(
-                label=f"{_tr(lang, 'Arc', 'القوس', 'Arc')} {arc['arc_name']}", 
+                label=f"{_tr(lang, 'Arc', 'القوس', 'Arc')} {arc['arc_name']}",
                 value=str(arc['arc_id']),
                 description=_tr(lang, f"View chapters for {arc['arc_name']}", f"عرض فصول {arc['arc_name']}", f"Voir les chapitres de {arc['arc_name']}"),
                 default=arc['arc_id'] == current_arc_id
@@ -119,7 +124,7 @@ class ChapterSelect(Select):
         self.lang = lang
 
     async def callback(self, interaction: discord.Interaction):
-        await interaction.response.defer()
+        await safe_defer(interaction.response)
         await self.view.show_arc_chapters(interaction, int(self.values[0]))
 
 class AdventureView(View):
@@ -195,7 +200,7 @@ class AdventureView(View):
         self.current_arc_id = arc_id
         embed = self.create_arc_embed(arc_id)
         if embed:
-            await interaction.message.edit(embed=embed, view=self)
+            await safe_edit(interaction.message, embed=embed, view=self)
 
 class AdventureCommands(commands.Cog):
     def __init__(self, bot):
@@ -234,7 +239,7 @@ class AdventureCommands(commands.Cog):
                 inline=False
             )
             
-        await ctx.send(embed=embed)
+        await safe_send(ctx, embed=embed)
 
     def get_rank_color(self, cardrank_id):
         rank_colors = {
@@ -260,7 +265,7 @@ class AdventureCommands(commands.Cog):
             )
 
             if not user_data:
-                await ctx.send(_tr(lang, "You don't have a profile yet! Create one first.", "ليس لديك ملف بعد! أنشئ واحدًا أولاً.", "Vous n’avez pas encore de profil ! Créez-en un d’abord."))
+                await safe_send(ctx, _tr(lang, "You don't have a profile yet! Create one first.", "ليس لديك ملف بعد! أنشئ واحدًا أولاً.", "Vous n’avez pas encore de profil ! Créez-en un d’abord."))
                 return
 
             user_id = user_data[0]['user_id']
@@ -280,18 +285,18 @@ class AdventureCommands(commands.Cog):
             )
 
             if not arcs:
-                await ctx.send(_tr(lang, "No adventure content available!", "لا توجد محتويات مغامرة متاحة!", "Aucun contenu d’aventure disponible !"))
+                await safe_send(ctx, _tr(lang, "No adventure content available!", "لا توجد محتويات مغامرة متاحة!", "Aucun contenu d’aventure disponible !"))
                 return
 
             # Create view with initial arc display
             view = AdventureView(self, ctx, user_id, arcs, chapters, user_chapters, lang)
             initial_embed = view.create_arc_embed(arcs[0]['arc_id'])
-            await ctx.send(embed=initial_embed, view=view)
+            await safe_send(ctx, embed=initial_embed, view=view)
 
         except Exception as e:
             logger.error(f"Error in sl_adventure: {e}")
             print(f"Error in sl_adventure: {e}")
-            await ctx.send(_tr(0, "An error occurred while fetching adventure data!", "حدث خطأ أثناء جلب بيانات المغامرة!", "Une erreur s’est produite lors de la récupération des données d’aventure !"))
+            await safe_send(ctx, _tr(0, "An error occurred while fetching adventure data!", "حدث خطأ أثناء جلب بيانات المغامرة!", "Une erreur s’est produite lors de la récupération des données d’aventure !"))
 
     @commands.group(name="chapter")
     async def chapter(self, ctx):
@@ -310,7 +315,7 @@ class AdventureCommands(commands.Cog):
                 value=_tr(lang, "View detailed information about a specific chapter and its cards.", "اعرض معلومات مفصلة حول فصل محدد وبطاقاته.", "Voir des informations détaillées sur un chapitre et ses cartes."),
                 inline=False
             )
-            await ctx.send(embed=embed)
+            await safe_send(ctx, embed=embed)
 
     @chapter.command(name="info")
     async def chapter_info(self, ctx, chapter_id: int = None):
@@ -320,7 +325,7 @@ class AdventureCommands(commands.Cog):
 
         if chapter_id is None:
             logger.warning("No chapter ID provided")
-            await ctx.send(_tr(lang, "Please provide a chapter ID! Usage: `sl chapter info <chapter_id>`", "يرجى تقديم معرف الفصل! الاستخدام: `sl chapter info <chapter_id>`", "Veuillez fournir un ID de chapitre ! Utilisation : `sl chapter info <chapter_id>`"))
+            await safe_send(ctx, _tr(lang, "Please provide a chapter ID! Usage: `sl chapter info <chapter_id>`", "يرجى تقديم معرف الفصل! الاستخدام: `sl chapter info <chapter_id>`", "Veuillez fournir un ID de chapitre ! Utilisation : `sl chapter info <chapter_id>`"))
             return
 
         try:
@@ -331,7 +336,7 @@ class AdventureCommands(commands.Cog):
             )
 
             if not user_data:
-                await ctx.send(_tr(lang, "You don't have a profile yet! Create one first.", "ليس لديك ملف بعد! أنشئ واحدًا أولاً.", "Vous n’avez pas encore de profil ! Créez-en un d’abord."))
+                await safe_send(ctx, _tr(lang, "You don't have a profile yet! Create one first.", "ليس لديك ملف بعد! أنشئ واحدًا أولاً.", "Vous n’avez pas encore de profil ! Créez-en un d’abord."))
                 return
 
             user_id = user_data[0]['user_id']
@@ -348,7 +353,7 @@ class AdventureCommands(commands.Cog):
             )
 
             if not chapter_data:
-                await ctx.send(_tr(lang, "Chapter not found!", "الفصل غير موجود!", "Chapitre introuvable !"))
+                await safe_send(ctx, _tr(lang, "Chapter not found!", "الفصل غير موجود!", "Chapitre introuvable !"))
                 return
 
             chapter = chapter_data[0]
@@ -426,18 +431,18 @@ class AdventureCommands(commands.Cog):
                         img_byte_arr.seek(0)
                         file = discord.File(fp=img_byte_arr, filename="chapter_cards.png")
                         embed.set_image(url="attachment://chapter_cards.png")
-                        await ctx.send(embed=embed, file=file)
+                        await safe_send(ctx, embed=embed, file=file)
                     else:
-                        await ctx.send(embed=embed)
+                        await safe_send(ctx, embed=embed)
                 except Exception as e:
                     logger.error(f"Error creating cards image: {e}")
-                    await ctx.send(embed=embed)
+                    await safe_send(ctx, embed=embed)
             else:
-                await ctx.send(embed=embed)
+                await safe_send(ctx, embed=embed)
 
         except Exception as e:
             logger.error(f"Database error in chapter info command: {e}")
-            await ctx.send(_tr(lang, "An error occurred while fetching chapter information!", "حدث خطأ أثناء جلب معلومات الفصل!", "Une erreur s’est produite lors de la récupération des informations du chapitre !"))
+            await safe_send(ctx, _tr(lang, "An error occurred while fetching chapter information!", "حدث خطأ أثناء جلب معلومات الفصل!", "Une erreur s’est produite lors de la récupération des informations du chapitre !"))
 
     async def create_cards_image(self, cards: List[Dict]) -> Optional[Image.Image]:
         """Create composite image of chapter cards with dynamic height"""
@@ -585,17 +590,19 @@ class AdventureCommands(commands.Cog):
             return None
 
     @chapter.command(name="start")
+    @advisory_lock_for_context("chapter_start", timeout=2)
     async def chapter_start(self, ctx, chapter_id: int = None):
         """Start a chapter battle with the specified chapter ID."""
         lang = await _get_lang(ctx.author.id)
 
         if chapter_id is None:
-            await ctx.send(_tr(lang, "Please provide a chapter ID! Usage: `sl chapter start <chapter_id>`",
+            await safe_send(ctx, _tr(lang, "Please provide a chapter ID! Usage: `sl chapter start <chapter_id>`",
                                "يرجى تقديم معرف الفصل! الاستخدام: `sl chapter start <chapter_id>`",
                                "Veuillez fournir un ID de chapitre ! Utilisation : `sl chapter start <chapter_id>`"))
             return
 
         user_id = None
+        chapter_claimed = False
         try:
             # Get user data
             user_data = await execute_query_with_retry(
@@ -604,7 +611,7 @@ class AdventureCommands(commands.Cog):
             )
 
             if not user_data:
-                await ctx.send(_tr(lang, "You don't have a profile yet! Create one first.",
+                await safe_send(ctx, _tr(lang, "You don't have a profile yet! Create one first.",
                                    "ليس لديك ملف بعد! أنشئ واحدًا أولاً.",
                                    "Vous n’avez pas encore de profil ! Créez-en un d’abord."))
                 return
@@ -625,7 +632,7 @@ class AdventureCommands(commands.Cog):
                                     "Vous êtes déjà dans un combat de chapitre ! Terminez d’abord votre combat en cours."),
                     color=discord.Color.red()
                 )
-                await ctx.send(embed=embed)
+                await safe_send(ctx, embed=embed)
                 return
 
             arc_data = await execute_query_with_retry(
@@ -634,7 +641,7 @@ class AdventureCommands(commands.Cog):
             )
 
             if not arc_data:
-                await ctx.send(_tr(lang, "Invalid chapter ID!", "معرّف الفصل غير صالح!", "ID de chapitre invalide !"))
+                await safe_send(ctx, _tr(lang, "Invalid chapter ID!", "معرّف الفصل غير صالح!", "ID de chapitre invalide !"))
                 return
 
             # Skip previous chapter check for Chapter 1
@@ -653,7 +660,7 @@ class AdventureCommands(commands.Cog):
                                         f"Vous devez d’abord terminer le Chapitre {chapter_id - 1} !"),
                         color=discord.Color.red()
                     )
-                    await ctx.send(embed=embed)
+                    await safe_send(ctx, embed=embed)
                     return
 
                 arc_id = arc_data[0]['arc_id']
@@ -696,14 +703,21 @@ class AdventureCommands(commands.Cog):
                                             f"Il vous faut {req - current_stars} étoiles de plus de l’arc précédent pour accéder à ce chapitre !"),
                             color=discord.Color.red()
                         )
-                        await ctx.send(embed=embed)
+                        await safe_send(ctx, embed=embed)
                         return
 
-            # Update user's chapter count
-            await execute_query_with_retry(
-                "UPDATE user SET chapter_count = 1 WHERE user_id = %s",
-                (user_id,)
-            )
+            # Atomically claim the chapter activity flag before entering battle setup.
+            chapter_claimed = await claim_user_activity(user_id, "chapter_count")
+            if not chapter_claimed:
+                embed = discord.Embed(
+                    title=_tr(lang, "❌ Chapter Battle Error", "❌ خطأ معركة الفصل", "❌ Erreur de combat de chapitre"),
+                    description=_tr(lang, "You are already in a chapter battle! Please finish your current battle first.",
+                                    "أنت بالفعل في معركة فصل! يرجى إنهاء معركتك الحالية أولاً.",
+                                    "Vous êtes déjà dans un combat de chapitre ! Terminez d’abord votre combat en cours."),
+                    color=discord.Color.red()
+                )
+                await safe_send(ctx, embed=embed)
+                return
 
             # Get team data
             team_data = await execute_query_with_retry(
@@ -712,7 +726,7 @@ class AdventureCommands(commands.Cog):
             )
 
             if not team_data:
-                await ctx.send(_tr(lang, "You need to create a team first!",
+                await safe_send(ctx, _tr(lang, "You need to create a team first!",
                                    "تحتاج إلى إنشاء فريق أولاً!",
                                    "Vous devez d’abord créer une équipe !"))
                 await execute_query_with_retry(
@@ -739,7 +753,7 @@ class AdventureCommands(commands.Cog):
             user_fighters = await execute_query_with_retry(user_cards_query, (user_id, team_id))
 
             if not user_fighters:
-                await ctx.send(_tr(lang, "You need at least one Fighter card in your team to start a chapter!",
+                await safe_send(ctx, _tr(lang, "You need at least one Fighter card in your team to start a chapter!",
                                    "تحتاج إلى بطاقة مقاتل واحدة على الأقل في فريقك لبدء فصل!",
                                    "Vous avez besoin d’au moins une carte Combattant dans votre équipe pour commencer un chapitre !"))
                 await execute_query_with_retry(
@@ -770,7 +784,7 @@ class AdventureCommands(commands.Cog):
             )
 
             if not chapter_data:
-                await ctx.send(_tr(lang, "Invalid chapter ID or no enemies found in this chapter!",
+                await safe_send(ctx, _tr(lang, "Invalid chapter ID or no enemies found in this chapter!",
                                    "معرّف فصل غير صالح أو لم يتم العثور على أعداء في هذا الفصل!",
                                    "ID de chapitre invalide ou aucun ennemi trouvé dans ce chapitre !"))
                 await execute_query_with_retry(
@@ -813,7 +827,13 @@ class AdventureCommands(commands.Cog):
                 description=_tr(lang, "Preparing for battle...", "جارٍ التحضير للمعركة...", "Préparation du combat..."),
                 color=discord.Color.dark_gold()
             )
-            battle_message = await ctx.send(embed=initial_embed)
+            ok, battle_message = await safe_send(ctx, embed=initial_embed)
+            if not ok or battle_message is None:
+                await execute_query_with_retry(
+                    "UPDATE user SET chapter_count = 0 WHERE user_id = %s",
+                    (user_id,)
+                )
+                return
             await asyncio.sleep(3)
 
             # Initialize battle state
@@ -841,7 +861,7 @@ class AdventureCommands(commands.Cog):
                     current_user_card, 
                     current_enemy, 
                     ctx.author.name, 
-                    f"{_tr(lang, 'Chapter', 'الفصل', 'Chapitre')} {chapter_id} {_tr(lang, 'Enemy', 'العدو', 'Ennemi')}", 
+                    f"{_tr(lang, 'Chapter', 'الفصل', 'Chapitre')} {chapter_id} {_tr(lang, 'Enemy', 'العدو', 'Ennemi')}",
                     is_challenge=False
                 )
 
@@ -853,8 +873,8 @@ class AdventureCommands(commands.Cog):
                     ctx.author.name, f"{_tr(lang, 'Chapter', 'الفصل', 'Chapitre')} {chapter_id} {_tr(lang, 'Enemy', 'العدو', 'Ennemi')}", battle_log[-5:]
                 )
 
-                await battle_message.remove_attachments(battle_message.attachments)
-                await battle_message.edit(attachments=[file], embed=embed)
+                await safe_remove_attachments(battle_message, battle_message.attachments)
+                await safe_edit(battle_message, attachments=[file], embed=embed)
 
                 fight_number = 1
                 
@@ -881,7 +901,7 @@ class AdventureCommands(commands.Cog):
                             embed, user_card, enemy, ctx.author.name,
                             f"{_tr(lang, 'Chapter', 'الفصل', 'Chapitre')} {chapter_id} {_tr(lang, 'Enemy', 'العدو', 'Ennemi')}", battle_log[-5:]
                         )
-                        await battle_message.edit(embed=embed)
+                        await safe_edit(battle_message, embed=embed, min_interval=1.0)
                         await asyncio.sleep(3)
 
                         if enemy['current_health'] > 0:
@@ -901,7 +921,7 @@ class AdventureCommands(commands.Cog):
                                 embed, user_card, enemy, ctx.author.name,
                                 f"{_tr(lang, 'Chapter', 'الفصل', 'Chapitre')} {chapter_id} {_tr(lang, 'Enemy', 'العدو', 'Ennemi')}", battle_log[-5:]
                             )
-                            await battle_message.edit(embed=embed)
+                            await safe_edit(battle_message, embed=embed, min_interval=1.0)
                             await asyncio.sleep(2)
 
                     # Handle fight outcome
@@ -927,8 +947,8 @@ class AdventureCommands(commands.Cog):
                                 embed, user_card, round_enemies[0],
                                 ctx.author.name, f"{_tr(lang, 'Chapter', 'الفصل', 'Chapitre')} {chapter_id} {_tr(lang, 'Enemy', 'العدو', 'Ennemi')}", battle_log[-5:]
                             )
-                            await battle_message.remove_attachments(battle_message.attachments)
-                            await battle_message.edit(attachments=[new_file], embed=embed)
+                            await safe_remove_attachments(battle_message, battle_message.attachments)
+                            await safe_edit(battle_message, attachments=[new_file], embed=embed)
                     else:
                         battle_log.append(_tr(lang,
                                               f"💔 **{user_card['card_name']} has been defeated!**",
@@ -950,8 +970,8 @@ class AdventureCommands(commands.Cog):
                                 embed, user_team[0], enemy,
                                 ctx.author.name, f"{_tr(lang, 'Chapter', 'الفصل', 'Chapitre')} {chapter_id} {_tr(lang, 'Enemy', 'العدو', 'Ennemi')}", battle_log[-5:]
                             )
-                            await battle_message.remove_attachments(battle_message.attachments)
-                            await battle_message.edit(attachments=[new_file], embed=embed)
+                            await safe_remove_attachments(battle_message, battle_message.attachments)
+                            await safe_edit(battle_message, attachments=[new_file], embed=embed)
 
                     # Check end conditions
                     if not user_team:
@@ -975,7 +995,7 @@ class AdventureCommands(commands.Cog):
                             "UPDATE user SET chapter_count = 0 WHERE user_id = %s",
                             (user_id,)
                         )
-                        await battle_message.edit(embed=embed)
+                        await safe_edit(battle_message, embed=embed, min_interval=1.0)
                         return
                     elif not round_enemies:
                         if current_round == total_rounds:
@@ -988,28 +1008,6 @@ class AdventureCommands(commands.Cog):
                             elif total_time <= second_star_time:
                                 stars_earned = 2
 
-                            # Check existing progress
-                            existing_progress = await execute_query_with_retry(
-                                "SELECT total_stars FROM user_chapters WHERE user_id = %s AND chapter_id = %s",
-                                (user_id, chapter_id)
-                            )
-
-                            if existing_progress:
-                                current_stars = existing_progress[0]['total_stars']
-                                if stars_earned > current_stars:
-                                    await execute_query_with_retry(
-                                        "UPDATE user_chapters SET total_stars = %s WHERE user_id = %s AND chapter_id = %s",
-                                        (stars_earned, user_id, chapter_id)
-                                    )
-                            else:
-                                await execute_query_with_retry(
-                                    "INSERT INTO user_chapters (user_id, chapter_id, total_stars) VALUES (%s, %s, %s)",
-                                    (user_id, chapter_id, stars_earned)
-                                )
-
-                            # Update charm counts without applying stat boosts
-                            await self.update_charm_counts(user_id, original_fighters)
-
                             # Create star display
                             stars_display = "<:reward:1309253302667710596>" * stars_earned
 
@@ -1021,17 +1019,26 @@ class AdventureCommands(commands.Cog):
                                           f"Félicitations {ctx.author.mention} ! Vous avez terminé le Chapitre {chapter_id} en {total_time} secondes !\nÉtoiles obtenues : {stars_display}"),
                                 inline=False
                             )
-                            await battle_message.edit(embed=embed)
-                            
-                            # Reset chapter count
-                            await execute_query_with_retry(
-                                "UPDATE user SET chapter_count = 0 WHERE user_id = %s",
-                                (user_id,)
+
+                            fighter_card_ids = [fighter['card_id'] for fighter in original_fighters]
+                            reward_payload = await self.process_chapter_completion(
+                                ctx,
+                                user_id,
+                                team_id,
+                                chapter_id,
+                                stars_earned,
+                                original_fighters,
+                                fighter_card_ids
                             )
-                            if not existing_progress:
-                                # Extract card IDs from original_fighters
-                                fighter_card_ids = [fighter['card_id'] for fighter in original_fighters]
-                                await self.handle_chapter_rewards(ctx, user_id, team_id, chapter_id, fighter_card_ids)
+                            await safe_edit(battle_message, embed=embed)
+                            if reward_payload:
+                                await self.send_chapter_rewards_embed(
+                                    ctx,
+                                    reward_payload["xp_rewards"],
+                                    reward_payload["total_xp_gained"],
+                                    reward_payload["total_cards_leveled"],
+                                    reward_payload["chest_info"],
+                                )
                             return
                         else:
                             battle_log.append(_tr(lang, "✨ **Round Complete!** Preparing for next round...",
@@ -1042,11 +1049,8 @@ class AdventureCommands(commands.Cog):
 
         except Exception as e:
             # Make sure to reset chapter count on error
-            if user_id:
-                await execute_query_with_retry(
-                    "UPDATE user SET chapter_count = 0 WHERE user_id = %s",
-                    (user_id,)
-                )
+            if chapter_claimed and user_id:
+                await release_user_activity(user_id, "chapter_count")
                 
             error_details = {
                 'error_type': type(e).__name__,
@@ -1068,47 +1072,33 @@ class AdventureCommands(commands.Cog):
                                 f"Une erreur s’est produite pendant le combat de chapitre :\n```{type(e).__name__} : {str(e)}```\nL’erreur a été consignée pour investigation."),
                 color=discord.Color.red()
             )
-            await ctx.send(embed=error_msg)
+            await safe_send(ctx, embed=error_msg)
 
-            # Prepare error message for support channel
-            error_message = (
-                f"🚨 Error in chapter system!\n"
-                f"```\nError: {str(e)}\n"
-                f"Channel: {ctx.channel.name} ({ctx.channel.id})\n"
-                f"Server: {ctx.guild.name} ({ctx.guild.id})\n"
-                f"Command User: {ctx.author.name} ({ctx.author.id})```\n"
-                f"Traceback:\n```python\n{traceback.format_exc()}```"
-            )
             
             try:
-                # Get the support channel and send error message
-                support_channel = self.bot.get_channel(1336306672741908561)
-                if support_channel:
-                    # First message with ping
-                    await support_channel.send("<@818132161534230559>")
-                    
-                    # Split and send error message
-                    if len(error_message) > 2000:
-                        parts = [error_message[i:i+1990] for i in range(0, len(error_message), 1990)]
-                        for part in parts:
-                            await support_channel.send(f"```{part}```")
-                    else:
-                        await support_channel.send(error_message)
-                else:
-                    print("Could not find support channel")
+                await send_support_error(
+                    self.bot,
+                    1336306672741908561,
+                    "Chapter system",
+                    e,
+                    ctx=ctx,
+                    extra={"chapter_id": chapter_id, "db_user_id": user_id},
+                )
             except Exception as send_error:
                 print(f"Failed to send error to support channel: {str(send_error)}")
-                print(error_message)
             
             # Clean up battle state
             try:
-                if user_id:  # Only if user_id was defined before error
-                    await execute_query_with_retry(
-                        "UPDATE user SET chapter_count = 0 WHERE user_id = %s",
-                        (user_id,)
-                    )
+                if chapter_claimed and user_id:  # Only release battles this command claimed.
+                    await release_user_activity(user_id, "chapter_count")
             except Exception as cleanup_error:
                 print("Cleanup error:", str(cleanup_error))
+        finally:
+            if chapter_claimed and user_id:
+                try:
+                    await release_user_activity(user_id, "chapter_count")
+                except Exception as cleanup_error:
+                    print("Final chapter cleanup error:", str(cleanup_error))
 
 
     async def apply_charm_effects(self, fighters, user_id):
@@ -1369,7 +1359,7 @@ class AdventureCommands(commands.Cog):
                 embed.add_field(name=name, value=value, inline=inline)
             
             # Update the message
-            await dungeon_message.edit(embed=embed)
+            await safe_edit(dungeon_message, embed=embed, min_interval=1.0)
         except Exception as e:
             logging.error(f"Error updating embed fields: {str(e)}")
             raise
@@ -1428,11 +1418,127 @@ class AdventureCommands(commands.Cog):
         damage_text = ""
         return f"{name}: {health_bar} **({health_percentage:.1f}%){damage_text}** ({max(0, entity['current_health'])}/{entity['health_stat']} {_tr(lang, 'HP', 'نقطة حياة', 'PV')})"
 
+    def get_chapter_chest_mappings(self, lang):
+        return {
+            1: {"id": 1, "name": _tr(lang, "Shadow Chest", "صندوق الظل", "Coffre de l'Ombre"), "icon": "<:shadowchest:1303850149122015324>"},
+            2: {"id": 2, "name": _tr(lang, "Hunter Chest", "صندوق الصياد", "Coffre du Chasseur"), "icon": "<:hunterchest:1303850110412783626>"},
+            3: {"id": 3, "name": _tr(lang, "Monarch Chest", "صندوق الملك", "Coffre du Monarque"), "icon": "<:mona:1309275864206278748>"}
+        }
+
+    async def build_chapter_reward_payload(self, ctx, user_id, team_id, chapter_id, fighter_card_ids=None):
+        """Apply first-clear chapter rewards and return display data inside the active transaction."""
+        lang = await _get_lang(ctx.author.id)
+        chapter_chest_data = await execute_query_with_retry(
+            "SELECT chapter_chest FROM chapter WHERE chapter_id = %s",
+            (chapter_id,)
+        )
+        if not chapter_chest_data:
+            raise RuntimeError(f"No chest data found for chapter_id: {chapter_id}")
+
+        chest_info = self.get_chapter_chest_mappings(lang).get(chapter_chest_data[0]['chapter_chest'])
+        inventory_result = await execute_query_with_retry(
+            "SELECT inventory_id FROM inventory WHERE user_id = %s FOR UPDATE",
+            (user_id,)
+        )
+        if not inventory_result:
+            raise RuntimeError("Inventory not found")
+
+        if chest_info:
+            await add_inventory_quantity("inventory_chest", inventory_result[0]['inventory_id'], chest_info['id'], 1)
+
+        xp_rewards, total_xp_gained, total_cards_leveled = await self.handle_xp_rewards(
+            ctx,
+            user_id,
+            team_id,
+            fighter_card_ids,
+            notify=False,
+        )
+        return {
+            "xp_rewards": xp_rewards,
+            "total_xp_gained": total_xp_gained,
+            "total_cards_leveled": total_cards_leveled,
+            "chest_info": chest_info,
+        }
+
+    async def process_chapter_completion(self, ctx, user_id, team_id, chapter_id, stars_earned, original_fighters, fighter_card_ids):
+        """Commit chapter progress, charm usage, and first-clear rewards together."""
+        reward_payload = None
+        async with db_transaction():
+            state_rows = await execute_query_with_retry(
+                "SELECT chapter_count FROM user WHERE user_id = %s FOR UPDATE",
+                (user_id,)
+            )
+            if not state_rows or state_rows[0].get('chapter_count') != 1:
+                return None
+            await execute_query_with_retry(
+                "UPDATE user SET chapter_count = 0 WHERE user_id = %s",
+                (user_id,)
+            )
+
+            existing_progress = await execute_query_with_retry(
+                "SELECT total_stars FROM user_chapters WHERE user_id = %s AND chapter_id = %s FOR UPDATE",
+                (user_id, chapter_id)
+            )
+
+            if existing_progress:
+                current_stars = existing_progress[0]['total_stars']
+                if stars_earned > current_stars:
+                    await execute_query_with_retry(
+                        "UPDATE user_chapters SET total_stars = %s WHERE user_id = %s AND chapter_id = %s",
+                        (stars_earned, user_id, chapter_id)
+                    )
+            else:
+                await execute_query_with_retry(
+                    "INSERT INTO user_chapters (user_id, chapter_id, total_stars) VALUES (%s, %s, %s)",
+                    (user_id, chapter_id, stars_earned)
+                )
+                reward_payload = await self.build_chapter_reward_payload(
+                    ctx,
+                    user_id,
+                    team_id,
+                    chapter_id,
+                    fighter_card_ids,
+                )
+
+            await self.update_charm_counts(user_id, original_fighters)
+
+        return reward_payload
+
     async def handle_chapter_rewards(self, ctx, user_id, team_id, chapter_id, fighter_card_ids=None):
         """Handle all rewards after completing a chapter"""
         print(f"Processing chapter rewards for user_id: {user_id}, team_id: {team_id}, chapter_id: {chapter_id}")
         
         try:
+            async with db_transaction():
+                state_rows = await execute_query_with_retry(
+                    "SELECT chapter_count FROM user WHERE user_id = %s FOR UPDATE",
+                    (user_id,)
+                )
+                if not state_rows or state_rows[0].get('chapter_count') != 1:
+                    return None
+
+                reward_payload = await self.build_chapter_reward_payload(
+                    ctx,
+                    user_id,
+                    team_id,
+                    chapter_id,
+                    fighter_card_ids,
+                )
+                await execute_query_with_retry(
+                    "UPDATE user SET chapter_count = 0 WHERE user_id = %s",
+                    (user_id,)
+                )
+
+            await self.send_chapter_rewards_embed(
+                ctx,
+                reward_payload["xp_rewards"],
+                reward_payload["total_xp_gained"],
+                reward_payload["total_cards_leveled"],
+                reward_payload["chest_info"],
+            )
+            logging.info(f"Rewards successfully sent to user_id: {user_id}")
+            return reward_payload
+
             lang = await _get_lang(ctx.author.id)
 
             # Get chapter chest info
@@ -1443,7 +1549,7 @@ class AdventureCommands(commands.Cog):
 
             if not chapter_chest_data:
                 print(f"No chest data found for chapter_id: {chapter_id}")
-                await ctx.send(_tr(lang, "Error retrieving chapter data!", "حدث خطأ أثناء جلب بيانات الفصل!", "Erreur lors de la récupération des données du chapitre !"))
+                await safe_send(ctx, _tr(lang, "Error retrieving chapter data!", "حدث خطأ أثناء جلب بيانات الفصل!", "Erreur lors de la récupération des données du chapitre !"))
                 return
 
             chapter_chest = chapter_chest_data[0]['chapter_chest']
@@ -1456,15 +1562,58 @@ class AdventureCommands(commands.Cog):
                 3: {"id": 3, "name": _tr(lang, "Monarch Chest", "صندوق الملك", "Coffre du Monarque"), "icon": "<:mona:1309275864206278748>"}
             }
 
-            # Get inventory ID
+            chest_info = chest_mappings.get(chapter_chest)
+
+            async with db_transaction():
+                inventory_result = await execute_query_with_retry(
+                    "SELECT inventory_id FROM inventory WHERE user_id = %s FOR UPDATE",
+                    (user_id,)
+                )
+
+                if not inventory_result:
+                    raise RuntimeError("Inventory not found")
+
+                inventory_id = inventory_result[0]['inventory_id']
+
+                if chest_info:
+                    existing_chest = await execute_query_with_retry(
+                        "SELECT quantiter FROM inventory_chest WHERE inventory_id = %s AND chest_id = %s FOR UPDATE",
+                        (inventory_id, chest_info['id'])
+                    )
+
+                    if existing_chest:
+                        await execute_query_with_retry(
+                            "UPDATE inventory_chest SET quantiter = quantiter + 1 WHERE inventory_id = %s AND chest_id = %s",
+                            (inventory_id, chest_info['id'])
+                        )
+                    else:
+                        await execute_query_with_retry(
+                            "INSERT INTO inventory_chest (inventory_id, chest_id, quantiter) VALUES (%s, %s, 1)",
+                            (inventory_id, chest_info['id'])
+                        )
+
+                xp_rewards, total_xp_gained, total_cards_leveled = await self.handle_xp_rewards(
+                    ctx, user_id, team_id, fighter_card_ids
+                )
+
+                await execute_query_with_retry(
+                    "UPDATE user SET chapter_count = 0 WHERE user_id = %s",
+                    (user_id,)
+                )
+
+            await self.send_chapter_rewards_embed(ctx, xp_rewards, total_xp_gained, total_cards_leveled, chest_info)
+            logging.info(f"Rewards successfully sent to user_id: {user_id}")
+            return
+
+            # Legacy non-transactional path kept unreachable after the return above.
             inventory_result = await execute_query_with_retry(
                 "SELECT inventory_id FROM inventory WHERE user_id = %s",
                 (user_id,)
             )
-            
+
             if not inventory_result:
                 print(f"No inventory found for user_id: {user_id}")
-                await ctx.send(_tr(lang, "Error: Inventory not found!", "خطأ: لم يتم العثور على الجرد!", "Erreur : inventaire introuvable !"))
+                await safe_send(ctx, _tr(lang, "Error: Inventory not found!", "خطأ: لم يتم العثور على الجرد!", "Erreur : inventaire introuvable !"))
                 return
 
             inventory_id = inventory_result[0]['inventory_id']
@@ -1520,9 +1669,9 @@ class AdventureCommands(commands.Cog):
         except Exception as e:
             logging.error(f"Error handling chapter rewards: {str(e)}")
             logging.error(traceback.format_exc())
-            await ctx.send(_tr(0, "An error occurred while processing rewards!", "حدث خطأ أثناء معالجة المكافآت!", "Une erreur s'est produite lors du traitement des récompenses !"))
+            await safe_send(ctx, _tr(0, "An error occurred while processing rewards!", "حدث خطأ أثناء معالجة المكافآت!", "Une erreur s'est produite lors du traitement des récompenses !"))
 
-    async def handle_xp_rewards(self, ctx, user_id, team_id, fighter_card_ids=None):
+    async def handle_xp_rewards(self, ctx, user_id, team_id, fighter_card_ids=None, notify: bool = True):
         """Handle XP distribution for team cards with proper equipment and support card handling"""
         print(f"Processing XP rewards for user_id: {user_id}, team_id: {team_id}")
         
@@ -1573,8 +1722,10 @@ class AdventureCommands(commands.Cog):
             
             if not team_cards:
                 print(f"No cards found for user_id: {user_id}, team_id: {team_id}")
-                await ctx.send(_tr(lang, "No cards found in your team. Unable to process XP rewards.", "لم يتم العثور على بطاقات في فريقك. لا يمكن معالجة نقاط الخبرة.", "Aucune carte trouvée dans votre équipe. Impossible de traiter l’XP."))
-                return [], 0, 0
+                if notify:
+                    await safe_send(ctx, _tr(lang, "No cards found in your team. Unable to process XP rewards.", "لم يتم العثور على بطاقات في فريقك. لا يمكن معالجة نقاط الخبرة.", "Aucune carte trouvée dans votre équipe. Impossible de traiter l’XP."))
+                    return [], 0, 0
+                raise RuntimeError("No cards found for chapter XP rewards")
 
             # Check for support cards in the team
             support_query = """
@@ -2295,13 +2446,13 @@ class AdventureCommands(commands.Cog):
             embed.set_footer(text=_tr(lang, "Keep fighting to grow stronger! | Solo Leveling PVP",
                                       "واصل القتال لتصبح أقوى! | Solo Leveling PVP",
                                       "Continue de te battre pour devenir plus fort ! | Solo Leveling PVP"))
-            await ctx.send(embed=embed)
+            await safe_send(ctx, embed=embed)
             logging.info("Rewards embed sent successfully")
             
         except Exception as e:
             logging.error(f"Error creating rewards embed: {str(e)}")
             logging.error(traceback.format_exc())
-            await ctx.send(_tr(0, "An error occurred while displaying rewards!",
+            await safe_send(ctx, _tr(0, "An error occurred while displaying rewards!",
                                "حدث خطأ أثناء عرض المكافآت!",
                                "Une erreur s'est produite lors de l'affichage des récompenses !"))
 

@@ -7,6 +7,8 @@ import logging
 import time
 import asyncio
 from utils.database import execute_query_with_retry, get_metrics
+from utils.db_atomic import db_advisory_lock, db_transaction
+from utils.inventory_ops import add_inventory_quantity, add_user_currency, get_inventory_id_for_user
 import functools
 from utils.captcha import captcha_handler
 # --- Localization helpers provided by you (DO NOT import anything extra) ---
@@ -46,7 +48,7 @@ def command_cooldown(rate=1, per=3.0, type=commands.BucketType.user):
     """
     cooldown = commands.Cooldown(rate, per)
     cooldowns = {}
-    
+
     def decorator(func):
         @functools.wraps(func)
         async def wrapper(self, ctx, *args, **kwargs):
@@ -59,7 +61,7 @@ def command_cooldown(rate=1, per=3.0, type=commands.BucketType.user):
                 key = ctx.guild.id if ctx.guild else ctx.author.id
             else:
                 key = ctx.author.id
-                
+
             # Check if the command is on cooldown
             bucket_key = f"{func.__name__}:{key}"
             if bucket_key in cooldowns:
@@ -78,7 +80,7 @@ def command_cooldown(rate=1, per=3.0, type=commands.BucketType.user):
             else:
                 # Create a new cooldown bucket
                 cooldowns[bucket_key] = commands.Cooldown(rate, per)
-                
+
             # Execute the command
             return await func(self, ctx, *args, **kwargs)
         return wrapper
@@ -162,9 +164,9 @@ class UserCommands(commands.Cog):
                 color=discord.Color.blue()
             )
             new_embed.set_image(url=image_links[current_index])
-            
+
             view = discord.ui.View(timeout=None)
-            
+
             if current_set == "default":
                 if current_index == len(image_links) - 1:
                     view.add_item(select_menu)
@@ -179,7 +181,7 @@ class UserCommands(commands.Cog):
                 view.add_item(previous_button)
                 view.add_item(next_button)
                 view.add_item(go_back_button)
-            
+
             await message.edit(embed=new_embed, view=view)
 
         async def scroll_callback(interaction, direction):
@@ -272,29 +274,29 @@ class UserCommands(commands.Cog):
         }
 
         user_authorid = str(ctx.author.id)
-        
+
         # Updated query to use user_cards table and join with card_rank
         query = """
-        SELECT 
+        SELECT
             u.won_currency,u.gamble_currency,u.candy_currency,
             COUNT(uc.card_id) as total_cards,
             MAX(c.card_rank) as highest_rank_id,
             MAX(cr.cardrank_name) as highest_rank_name
-        FROM 
+        FROM
             user u
-        LEFT JOIN 
+        LEFT JOIN
             user_cards uc ON u.user_id = uc.user_id
-        LEFT JOIN 
+        LEFT JOIN
             card c ON uc.card_id = c.card_id
         LEFT JOIN
             card_rank cr ON c.card_rank = cr.cardrank_id
-        WHERE 
+        WHERE
             u.user_authorid = %s
-        GROUP BY 
+        GROUP BY
             u.user_id
         """
         result = await execute_query_with_retry(query, (user_authorid,))
-        
+
         # Check if user exists
         if not result:
             embed = discord.Embed(
@@ -366,7 +368,7 @@ class UserCommands(commands.Cog):
             "Chaque carte est un pas vers la grandeur !"
         ]
         tips = tips_en if lang == 0 else (tips_ar if lang == 1 else tips_fr)
-        
+
         embed.set_footer(text=random.choice(tips))
 
         await ctx.send(embed=embed)
@@ -375,11 +377,11 @@ class UserCommands(commands.Cog):
     async def register(self, ctx):
         # *** DO NOT TOUCH per your request ***
         user_authorid = str(ctx.author.id)
-        
+
         # Check if user already exists
         query = "SELECT user_id FROM user WHERE user_authorid = %s"
         result = await execute_query_with_retry(query, (user_authorid,))
-        
+
         if result:
             embed = discord.Embed(
                 title="🚫 Registration Failed",
@@ -410,19 +412,19 @@ class UserCommands(commands.Cog):
                 return
 
             await interaction.response.defer()
-            
+
             # RECHECK: Ensure user is not already registered
             user_authorid = str(interaction.user.id)
             check_query = "SELECT user_id FROM user WHERE user_authorid = %s"
             existing_user = await execute_query_with_retry(check_query, (user_authorid,))
-            
+
             if existing_user:
                 # User is already registered, disable buttons and show error
                 view.clear_items()
                 register_button.disabled = True
                 guide_button.disabled = True
                 await interaction.edit_original_response(view=view)
-                
+
                 embed = discord.Embed(
                     title="🚫 Registration Failed",
                     description="It seems you've already joined the ranks, Hunter. Use sl mycards or sl mc to view your current collection.",
@@ -431,13 +433,13 @@ class UserCommands(commands.Cog):
                 embed.set_thumbnail(url="https://i.imgur.com/X3ViR9W.png")
                 await interaction.followup.send(embed=embed, ephemeral=True)
                 return
-            
+
             # Disable buttons after interaction
             view.clear_items()
             register_button.disabled = True
             guide_button.disabled = True
             await interaction.edit_original_response(view=view)
-            
+
             await self.complete_registration(ctx, user_authorid)
 
         async def guide_callback(interaction):
@@ -447,13 +449,13 @@ class UserCommands(commands.Cog):
                 return
 
             await interaction.response.defer()
-            
+
             # Disable buttons after interaction
             view.clear_items()
             register_button.disabled = True
             guide_button.disabled = True
             await interaction.edit_original_response(view=view)
-            
+
             await self.show_guide(ctx, intro_embed, message)
 
         register_button.callback = register_callback
@@ -465,26 +467,45 @@ class UserCommands(commands.Cog):
         message = await ctx.send(embed=intro_embed, view=view)
 
     async def complete_registration(self, ctx, user_authorid):
-        # *** DO NOT TOUCH per your request ***
-        query = """INSERT INTO user (user_authorid, entry_date, rank, won_currency, roll_cap, fragment_cap,team_count,team_cap) 
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)"""
-        current_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        await execute_query_with_retry(query, (user_authorid, current_date, 1, 100000, 11, 200, 1, 4))
+        created = False
+        async with db_advisory_lock(f"slbot:register:{user_authorid}"):
+            async with db_transaction() as tx:
+                existing = await execute_query_with_retry(
+                    "SELECT user_id FROM user WHERE user_authorid = %s",
+                    (user_authorid,)
+                )
+                if existing:
+                    created = False
+                else:
+                    query = """INSERT INTO user (user_authorid, entry_date, rank, won_currency, roll_cap, fragment_cap,team_count,team_cap)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)"""
+                    current_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    await tx.execute(query, (user_authorid, current_date, 1, 100000, 11, 200, 1, 4))
+                    user_id = tx.cursor.lastrowid
 
-        query = "SELECT user_id FROM user WHERE user_authorid = %s"
-        result = await execute_query_with_retry(query, (user_authorid,))
-        user_id = result[0]['user_id']
+                    await tx.execute("INSERT INTO team (user_id,team_bg) VALUES (%s,'curr.png')", (user_id,))
+                    team_id = tx.cursor.lastrowid
+                    await execute_query_with_retry(
+                        "UPDATE user SET current_team = %s WHERE user_id = %s",
+                        (team_id, user_id)
+                    )
 
-        query = "INSERT INTO team (user_id,team_bg) VALUES (%s,'curr.png')"
-        await execute_query_with_retry(query, (user_id,))
-        queryd = "SELECT team_id FROM team WHERE user_id = %s"
-        results = await execute_query_with_retry(queryd, (user_id,))
-        team_id = results[0]['team_id']
-        query = "UPDATE user SET current_team = %s WHERE user_id = %s"
-        await execute_query_with_retry(query, (team_id,user_id))
+                    await execute_query_with_retry(
+                        "INSERT INTO inventory (user_id) VALUES (%s)",
+                        (user_id,)
+                    )
+                    created = True
 
-        query = "INSERT INTO inventory (user_id) VALUES (%s)"
-        await execute_query_with_retry(query, (user_id,))
+        if not created:
+            embed = discord.Embed(
+                title="🚫 Registration Failed",
+                description="It seems you've already joined the ranks, Hunter. Use sl mycards or sl mc to view your current collection.",
+                color=discord.Color.red()
+            )
+            embed.set_thumbnail(url="https://i.imgur.com/X3ViR9W.png")
+            await ctx.send(embed=embed)
+            return
+
         embed = discord.Embed(
             title="🏆 Welcome to the Hunter's Association!",
             description=(
@@ -546,9 +567,9 @@ class UserCommands(commands.Cog):
                 color=discord.Color.blue()
             )
             new_embed.set_image(url=image_links[current_index])
-            
+
             view = discord.ui.View(timeout=None)
-            
+
             if current_set == "default":
                 if current_index == len(image_links) - 1:
                     view.add_item(select_menu)
@@ -563,7 +584,7 @@ class UserCommands(commands.Cog):
                 view.add_item(previous_button)
                 view.add_item(next_button)
                 view.add_item(go_back_button)
-            
+
             await message.edit(embed=new_embed, view=view)
         async def scroll_callback(interaction, direction):
             nonlocal current_index
@@ -644,7 +665,7 @@ class UserCommands(commands.Cog):
             SELECT user_id,prenium, entry_date, won_currency,gamble_currency,
                    e_dungeon_points, c_dungeon_points, s_dungeon_points,a_dungeon_points,b_dungeon_points,d_dungeon_points,
                    win_streak, alltimewins, mission_streak, alltime_squad, squad_streak,votecount,votestreak
-            FROM user 
+            FROM user
             WHERE user_authorid = %s
             """
             user_results = await execute_query_with_retry(user_query, (str(ctx.author.id),))
@@ -659,7 +680,7 @@ class UserCommands(commands.Cog):
             # 2. Get inventory ID
             inventory_query = "SELECT inventory_id FROM inventory WHERE user_id = %s"
             inventory_results = await execute_query_with_retry(inventory_query, (user_id,))
-            
+
             if not inventory_results:
                 await ctx.send(_tr(lang, "❌ No inventory found for this user.", "❌ لم يتم العثور على مخزون لهذا المستخدم.", "❌ Aucun inventaire trouvé pour cet utilisateur."))
                 return
@@ -668,7 +689,7 @@ class UserCommands(commands.Cog):
 
             # 3. Card Collection
             card_collection_query = """
-            SELECT 
+            SELECT
                 COUNT(*) as total_cards,
                 SUM(CASE WHEN c.type_card = 'Fighter' THEN 1 ELSE 0 END) as offence,
                 SUM(CASE WHEN c.type_card = 'Support' THEN 1 ELSE 0 END) as support,
@@ -682,23 +703,23 @@ class UserCommands(commands.Cog):
 
             # 4. Resources
             frag_query = """
-            SELECT SUM(quantiter) as total_fragments 
-            FROM inventory_frags 
+            SELECT SUM(quantiter) as total_fragments
+            FROM inventory_frags
             WHERE inventory_id = %s
             """
             frag_results = await execute_query_with_retry(frag_query, (inventory_id,))
             frag_results = frag_results[0]
 
             equip_query = """
-            SELECT SUM(quantiter) as total_equipment 
-            FROM inventory_weapon 
+            SELECT SUM(quantiter) as total_equipment
+            FROM inventory_weapon
             WHERE inventory_id = %s
             """
             equip_results = await execute_query_with_retry(equip_query, (inventory_id,))
             equip_results = equip_results[0]
 
             product_query = """
-            SELECT 
+            SELECT
                 SUM(CASE WHEN product_id IN (9, 10, 11, 12) THEN quantiter ELSE 0 END) as boosters,
                 SUM(CASE WHEN product_id IN (2, 3, 14, 15, 16) THEN quantiter ELSE 0 END) as resets,
                 SUM(CASE WHEN product_id = 17 THEN quantiter ELSE 0 END) as enhancers
@@ -714,7 +735,7 @@ class UserCommands(commands.Cog):
                 color=discord.Color.gold(),
                 description=_tr(lang, "Your journey through the hunter world continues!", "رحلتك في عالم الصيادين مستمرة!", "Votre aventure dans le monde des chasseurs continue !")
             )
-            
+
             if ctx.author.avatar and hasattr(ctx.author.avatar, 'url'):
                 embed.set_thumbnail(url=ctx.author.avatar.url)
 
@@ -731,7 +752,7 @@ class UserCommands(commands.Cog):
 
             # Account Overview
             embed.add_field(
-                name=_tr(lang, "📋 Account Overview", "📋 نظرة عامة على الحساب", "📋 Aperçu du compte"), 
+                name=_tr(lang, "📋 Account Overview", "📋 نظرة عامة على الحساب", "📋 Aperçu du compte"),
                 value=_tr(
                     lang,
                     f"**<:blue_dot:1311418123404181585> Started**: `{user_data['entry_date'].strftime('%Y-%m-%d')}`\n"
@@ -740,10 +761,10 @@ class UserCommands(commands.Cog):
                     f"**<:blue_dot:1311418123404181585> البريميوم**: `{tier}`",
                     f"**<:blue_dot:1311418123404181585> Début** : `{user_data['entry_date'].strftime('%Y-%m-%d')}`\n"
                     f"**<:blue_dot:1311418123404181585> Abonnement** : `{tier}`"
-                ), 
+                ),
                 inline=False
             )
-            
+
             # Card Collection
             card_collection_text = _tr(
                 lang,
@@ -761,11 +782,11 @@ class UserCommands(commands.Cog):
                 f"<:blue_dot:1311418123404181585> **Booster** : `{card_results['booster']}`"
             )
             embed.add_field(
-                name=_tr(lang, "<:cards:1311415093514342441> Card Collection", "<:cards:1311415093514342441> مجموعة البطاقات", "<:cards:1311415093514342441> Collection de Cartes"), 
-                value=card_collection_text, 
+                name=_tr(lang, "<:cards:1311415093514342441> Card Collection", "<:cards:1311415093514342441> مجموعة البطاقات", "<:cards:1311415093514342441> Collection de Cartes"),
+                value=card_collection_text,
                 inline=False
             )
-            
+
             # Resources
             resources_text = _tr(
                 lang,
@@ -792,11 +813,11 @@ class UserCommands(commands.Cog):
                 f"<:blue_dot:1311418123404181585> **Améliorants** : `{product_results['enhancers']}`"
             )
             embed.add_field(
-                name=_tr(lang, "<:treasurechest:1312772522432925746> Resources", "<:treasurechest:1312772522432925746> الموارد", "<:treasurechest:1312772522432925746> Ressources"), 
-                value=resources_text, 
+                name=_tr(lang, "<:treasurechest:1312772522432925746> Resources", "<:treasurechest:1312772522432925746> الموارد", "<:treasurechest:1312772522432925746> Ressources"),
+                value=resources_text,
                 inline=False
             )
-            
+
             # Dungeon Progress
             dungeon_text = _tr(
                 lang,
@@ -820,11 +841,11 @@ class UserCommands(commands.Cog):
                 f"<:blue_dot:1311418123404181585> **Donjons Rang E** : `{user_data['e_dungeon_points']}`"
             )
             embed.add_field(
-                name=_tr(lang, "<:dungeonchaos:1311414124990824570> Dungeon Progress", "<:dungeonchaos:1311414124990824570> تقدم الأبراج", "<:dungeonchaos:1311414124990824570> Progression Donjons"), 
-                value=dungeon_text, 
+                name=_tr(lang, "<:dungeonchaos:1311414124990824570> Dungeon Progress", "<:dungeonchaos:1311414124990824570> تقدم الأبراج", "<:dungeonchaos:1311414124990824570> Progression Donjons"),
+                value=dungeon_text,
                 inline=False
             )
-            
+
             # PvP Statistics
             pvp_text = _tr(
                 lang,
@@ -851,15 +872,15 @@ class UserCommands(commands.Cog):
                 f"<:blue_dot:1311418123404181585> **Nombre de votes** : `{user_data['votestreak']}`"
             )
             embed.add_field(
-                name=_tr(lang, "<:Skill_Stats_icon56:1311414108259881052> Records Statistics", "<:Skill_Stats_icon56:1311414108259881052> إحصائيات السجلات", "<:Skill_Stats_icon56:1311414108259881052> Statistiques des Records"), 
-                value=pvp_text, 
+                name=_tr(lang, "<:Skill_Stats_icon56:1311414108259881052> Records Statistics", "<:Skill_Stats_icon56:1311414108259881052> إحصائيات السجلات", "<:Skill_Stats_icon56:1311414108259881052> Statistiques des Records"),
+                value=pvp_text,
                 inline=False
             )
-            
+
             # Add last updated timestamp in footer
             last_updated = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
             embed.set_footer(text=_tr(lang, f"🕒 Last Updated: {last_updated}", f"🕒 آخر تحديث: {last_updated}", f"🕒 Dernière mise à jour : {last_updated}"))
-            
+
             await ctx.send(embed=embed)
 
         except Exception as e:
@@ -871,13 +892,13 @@ class UserCommands(commands.Cog):
         """ Calculate remaining time for a specific command. """
         if last_timestamp is None:
             return None
-            
+
         if isinstance(last_timestamp, str):
             try:
                 last_timestamp = datetime.strptime(last_timestamp, '%Y-%m-%d %H:%M:%S')
             except ValueError:
                 return None
-                
+
         current_time = datetime.now()
         time_since_last_use = current_time - last_timestamp
         remaining_time = duration - time_since_last_use
@@ -900,10 +921,10 @@ class UserCommands(commands.Cog):
         """ Check cooldowns for various commands in Solo Leveling bot. """
         lang = await _get_lang(ctx.author.id)
         try:
-            query = """ 
+            query = """
             SELECT user_id, roll_timer,date_daily, fight_timer, mission_timer, dungeon_timer, mine_timer, squad_timer
-            FROM `user` 
-            WHERE user_authorid = %s 
+            FROM `user`
+            WHERE user_authorid = %s
             """
             user_data = await execute_query_with_retry(query, (str(ctx.author.id),))
             if not user_data:
@@ -933,7 +954,7 @@ class UserCommands(commands.Cog):
                 icon = data['icon']
 
                 remaining = self.calculate_remaining_time(timestamp, duration)
-                
+
                 # Localized field names
                 field_name = _tr(
                     lang,
@@ -941,7 +962,7 @@ class UserCommands(commands.Cog):
                     f"{icon} تبريد {command_name}",
                     f"{icon} Recharge {command_name}"
                 )
-                
+
                 if remaining is None:
                     field_value = _tr(lang, "✅ Available Now", "✅ متاح الآن", "✅ Disponible maintenant")
                 else:
@@ -952,10 +973,10 @@ class UserCommands(commands.Cog):
                         f"⏳ التهدئة: متبقّي {human}",
                         f"⏳ Recharge : {human} restante"
                     )
-                
+
                 embed.add_field(
-                    name=field_name, 
-                    value=field_value, 
+                    name=field_name,
+                    value=field_value,
                     inline=False
                 )
 
@@ -968,198 +989,168 @@ class UserCommands(commands.Cog):
     @commands.command(name="giveboost")
     async def give_itemboost(self, ctx, user: discord.Member = None, amount: int = 1):
         # Check if command user is authorized
-        if str(ctx.author.id) not in ("818132161534230559","1384189515199021127", "1076303866854899762", "1204879494901407805"):
+        if str(ctx.author.id) not in ("818132161534230559","1159962065432236162","1384189515199021127", "1076303866854899762", "1204879494901407805"):
             return  # Silently ignore if not authorized
-            
+
         if user is None:
             await ctx.send("Please specify a user: `sl give @user [amount]`")
             return
-            
+
         try:
             # Check if user exists in database by Discord ID
             check_user_query = "SELECT user_id FROM user WHERE user_authorid = %s"
             user_results = await execute_query_with_retry(check_user_query, (str(user.id),))
-            
+
             if not user_results:
                 await ctx.send(f"User {user.mention} is not registered in the database.")
                 return
-                
+
             user_id = user_results[0]['user_id']
-            
-            # Get the inventory_id for the user
-            inventory_query = "SELECT inventory_id FROM inventory WHERE user_id = %s"
-            inventory_results = await execute_query_with_retry(inventory_query, (user_id,))
-            
-            if not inventory_results:
-                await ctx.send(f"User {user.mention} doesn't have an inventory.")
-                return
-                
-            inventory_id = inventory_results[0]['inventory_id']
-            
-            # Check if product_id 2 exists for this inventory
-            check_product_query = "SELECT quantiter FROM inventory_product WHERE inventory_id = %s AND product_id = 1"
-            product_results = await execute_query_with_retry(check_product_query, (inventory_id,))
-            
-            if product_results:
-                # Update existing product quantity
-                update_query = "UPDATE inventory_product SET quantiter = quantiter + %s WHERE inventory_id = %s AND product_id = 1"
-                await execute_query_with_retry(update_query, (amount, inventory_id))
-                await ctx.send(f"Added {amount} item(s) to {user.mention}'s inventory.")
-            else:
-                # Insert new product entry
-                insert_query = "INSERT INTO inventory_product (inventory_id, product_id, quantiter) VALUES (%s, 1, %s)"
-                await execute_query_with_retry(insert_query, (inventory_id, amount))
-                await ctx.send(f"Added {amount} item(s) to {user.mention}'s inventory (new item).")
-                
+
+            async with db_advisory_lock(f"slbot:admin_grant:{user_id}", timeout=5):
+                async with db_transaction():
+                    inventory_id = await get_inventory_id_for_user(user_id)
+                    if inventory_id is None:
+                        await ctx.send(f"User {user.mention} doesn't have an inventory.")
+                        return
+                    await add_inventory_quantity("inventory_product", inventory_id, 1, amount)
+
+            await ctx.send(f"Added {amount} item(s) to {user.mention}'s inventory.")
+
         except Exception as e:
             await ctx.send(f"Error: {str(e)}")
 
     @commands.command(name="ggive")
     async def give_gwoncurrency(self, ctx, user: discord.Member = None, amount: int = None):
         # Check if command user is authorized
-        if str(ctx.author.id) not in ("818132161534230559", "1384189515199021127","1076303866854899762", "1204879494901407805"):
+        if str(ctx.author.id) not in ("818132161534230559", "1159962065432236162","1384189515199021127","1076303866854899762", "1204879494901407805"):
             return  # Silently ignore if not authorized
-            
+
         if user is None:
             await ctx.send("Please specify a user: `sl wgive @user amount`")
             return
-            
+
         if amount is None:
             await ctx.send("Please specify an amount: `sl wgive @user amount`")
             return
-        
+
         try:
             # Check if user exists in database by Discord ID
             check_user_query = "SELECT user_id FROM user WHERE user_authorid = %s"
             user_results = await execute_query_with_retry(check_user_query, (str(user.id),))
-            
+
             if not user_results:
                 await ctx.send(f"User {user.mention} is not registered in the database.")
                 return
-                
+
             user_id = user_results[0]['user_id']
-            
-            # Update user's won_currency
-            update_query = "UPDATE user SET gamble_currency = gamble_currency + %s WHERE user_id = %s"
-            await execute_query_with_retry(update_query, (amount, user_id))
-            
+
+            async with db_advisory_lock(f"slbot:admin_grant:{user_id}", timeout=5):
+                async with db_transaction():
+                    await add_user_currency(user_id, "gamble_currency", amount)
+
             await ctx.send(f"Added {amount} currency to {user.mention}'s account.")
-            
+
         except Exception as e:
             await ctx.send(f"Error: {str(e)}")
     @commands.command(name="cgive")
     async def give_gwoncurrency(self, ctx, user: discord.Member = None, amount: int = None):
         # Check if command user is authorized
-        if str(ctx.author.id) not in ("818132161534230559", "1384189515199021127","1076303866854899762", "1204879494901407805"):
+        if str(ctx.author.id) not in ("818132161534230559", "1159962065432236162","1384189515199021127","1076303866854899762", "1204879494901407805"):
             return  # Silently ignore if not authorized
-            
+
         if user is None:
             await ctx.send("Please specify a user: `sl wgive @user amount`")
             return
-            
+
         if amount is None:
             await ctx.send("Please specify an amount: `sl wgive @user amount`")
             return
-        
+
         try:
             # Check if user exists in database by Discord ID
             check_user_query = "SELECT user_id FROM user WHERE user_authorid = %s"
             user_results = await execute_query_with_retry(check_user_query, (str(user.id),))
-            
+
             if not user_results:
                 await ctx.send(f"User {user.mention} is not registered in the database.")
                 return
-                
+
             user_id = user_results[0]['user_id']
-            
-            # Update user's won_currency
-            update_query = "UPDATE user SET candy_currency = candy_currency + %s WHERE user_id = %s"
-            await execute_query_with_retry(update_query, (amount, user_id))
-            
+
+            async with db_advisory_lock(f"slbot:admin_grant:{user_id}", timeout=5):
+                async with db_transaction():
+                    await add_user_currency(user_id, "candy_currency", amount)
+
             await ctx.send(f"Added {amount} currency to {user.mention}'s account.")
-            
+
         except Exception as e:
             await ctx.send(f"Error: {str(e)}")
     @commands.command(name="give")
     async def give_item(self, ctx, user: discord.Member = None, amount: int = 1):
         # Check if command user is authorized
-        if str(ctx.author.id) not in ("818132161534230559", "1384189515199021127","1076303866854899762", "1204879494901407805"):
+        if str(ctx.author.id) not in ("818132161534230559", "1159962065432236162","1384189515199021127","1076303866854899762", "1204879494901407805"):
             return  # Silently ignore if not authorized
-            
+
         if user is None:
             await ctx.send("Please specify a user: `sl give @user [amount]`")
             return
-            
+
         try:
             # Check if user exists in database by Discord ID
             check_user_query = "SELECT user_id FROM user WHERE user_authorid = %s"
             user_results = await execute_query_with_retry(check_user_query, (str(user.id),))
-            
+
             if not user_results:
                 await ctx.send(f"User {user.mention} is not registered in the database.")
                 return
-                
+
             user_id = user_results[0]['user_id']
-            
-            # Get the inventory_id for the user
-            inventory_query = "SELECT inventory_id FROM inventory WHERE user_id = %s"
-            inventory_results = await execute_query_with_retry(inventory_query, (user_id,))
-            
-            if not inventory_results:
-                await ctx.send(f"User {user.mention} doesn't have an inventory.")
-                return
-                
-            inventory_id = inventory_results[0]['inventory_id']
-            
-            # Check if product_id 2 exists for this inventory
-            check_product_query = "SELECT quantiter FROM inventory_product WHERE inventory_id = %s AND product_id = 2"
-            product_results = await execute_query_with_retry(check_product_query, (inventory_id,))
-            
-            if product_results:
-                # Update existing product quantity
-                update_query = "UPDATE inventory_product SET quantiter = quantiter + %s WHERE inventory_id = %s AND product_id = 2"
-                await execute_query_with_retry(update_query, (amount, inventory_id))
-                await ctx.send(f"Added {amount} item(s) to {user.mention}'s inventory.")
-            else:
-                # Insert new product entry
-                insert_query = "INSERT INTO inventory_product (inventory_id, product_id, quantiter) VALUES (%s, 2, %s)"
-                await execute_query_with_retry(insert_query, (inventory_id, amount))
-                await ctx.send(f"Added {amount} item(s) to {user.mention}'s inventory (new item).")
-                
+
+            async with db_advisory_lock(f"slbot:admin_grant:{user_id}", timeout=5):
+                async with db_transaction():
+                    inventory_id = await get_inventory_id_for_user(user_id)
+                    if inventory_id is None:
+                        await ctx.send(f"User {user.mention} doesn't have an inventory.")
+                        return
+                    await add_inventory_quantity("inventory_product", inventory_id, 2, amount)
+
+            await ctx.send(f"Added {amount} item(s) to {user.mention}'s inventory.")
+
         except Exception as e:
             await ctx.send(f"Error: {str(e)}")
 
     @commands.command(name="wgive")
     async def give_currency(self, ctx, user: discord.Member = None, amount: int = None):
         # Check if command user is authorized
-        if str(ctx.author.id) not in ("818132161534230559","1384189515199021127", "1076303866854899762", "1204879494901407805"):
+        if str(ctx.author.id) not in ("818132161534230559","1159962065432236162","1384189515199021127", "1076303866854899762", "1204879494901407805"):
             return  # Silently ignore if not authorized
-            
+
         if user is None:
             await ctx.send("Please specify a user: `sl wgive @user amount`")
             return
-            
+
         if amount is None:
             await ctx.send("Please specify an amount: `sl wgive @user amount`")
             return
-        
+
         try:
             # Check if user exists in database by Discord ID
             check_user_query = "SELECT user_id FROM user WHERE user_authorid = %s"
             user_results = await execute_query_with_retry(check_user_query, (str(user.id),))
-            
+
             if not user_results:
                 await ctx.send(f"User {user.mention} is not registered in the database.")
                 return
-                
+
             user_id = user_results[0]['user_id']
-            
-            # Update user's won_currency
-            update_query = "UPDATE user SET won_currency = won_currency + %s WHERE user_id = %s"
-            await execute_query_with_retry(update_query, (amount, user_id))
-            
+
+            async with db_advisory_lock(f"slbot:admin_grant:{user_id}", timeout=5):
+                async with db_transaction():
+                    await add_user_currency(user_id, "won_currency", amount)
+
             await ctx.send(f"Added {amount} currency to {user.mention}'s account.")
-            
+
         except Exception as e:
             await ctx.send(f"Error: {str(e)}")
 
@@ -1170,23 +1161,23 @@ class UserCommands(commands.Cog):
         if str(ctx.author.id) != "818132161534230559" and not ctx.author.guild_permissions.administrator:
             await ctx.send("You don't have permission to use this command.")
             return
-        
+
         try:
             metrics = get_metrics()
-            
+
             embed = discord.Embed(
                 title="📊 Database Connection Statistics",
                 color=discord.Color.blue()
             )
-            
+
             embed.add_field(name="Active Connections", value=str(metrics["active_connections"]), inline=True)
             embed.add_field(name="Peak Connections", value=str(metrics["peak_connections"]), inline=True)
             embed.add_field(name="Connection Errors", value=str(metrics["connection_errors"]), inline=True)
-            
+
             embed.add_field(name="Total Queries", value=str(metrics["total_queries"]), inline=True)
             embed.add_field(name="Slow Queries", value=f"{metrics['slow_queries']} ({metrics['slow_query_percentage']:.1f}%)", inline=True)
             embed.add_field(name="Avg Query Time", value=f"{metrics['avg_query_time']:.2f}ms", inline=True)
-            
+
             if metrics["last_error"]:
                 error_time = metrics["last_error_time"].strftime("%Y-%m-%d %H:%M:%S") if metrics["last_error_time"] else "Unknown"
                 embed.add_field(
@@ -1194,79 +1185,64 @@ class UserCommands(commands.Cog):
                     value=f"Time: {error_time}\nError: {metrics['last_error'][:100]}...",
                     inline=False
                 )
-            
+
             embed.set_footer(text=f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             await ctx.send(embed=embed)
-            
+
         except Exception as e:
             await ctx.send(f"An error occurred: {str(e)}")
     @commands.command(name="givechest")
     async def give_chest(self, ctx, *, args=None):
         # Check if command user is authorized
-        if str(ctx.author.id) not in ("818132161534230559","1384189515199021127", "1076303866854899762", "1204879494901407805"):
+        if str(ctx.author.id) not in ("818132161534230559","1159962065432236162","1384189515199021127", "1076303866854899762", "1204879494901407805"):
             return  # Silently ignore if not authorized
-            
+
         if args is None:
             await ctx.send("Please use format: `sl givechest rarity,discord_id,quantity`")
             return
-            
+
         try:
             # Split arguments by comma
             parts = [part.strip() for part in args.split(',')]
-            
+
             if len(parts) < 2:
                 await ctx.send("Please use format: `sl givechest rarity,discord_id,quantity`")
                 return
-                
+
             rarity = parts[0]
             discord_id = parts[1]
             quantity = int(parts[2]) if len(parts) > 2 else 1
-            
+
             # Check if user exists in database by Discord ID
             check_user_query = "SELECT user_id FROM user WHERE user_authorid = %s"
             user_results = await execute_query_with_retry(check_user_query, (discord_id,))
-            
+
             if not user_results:
                 await ctx.send(f"User with Discord ID {discord_id} is not registered in the database.")
                 return
-                
+
             user_id = user_results[0]['user_id']
-            
-            # Get the inventory_id for the user
-            inventory_query = "SELECT inventory_id FROM inventory WHERE user_id = %s"
-            inventory_results = await execute_query_with_retry(inventory_query, (user_id,))
-            
-            if not inventory_results:
-                await ctx.send(f"User with Discord ID {discord_id} doesn't have an inventory.")
-                return
-                
-            inventory_id = inventory_results[0]['inventory_id']
-            
+
             # Check if chest rarity exists using LIKE
             chest_query = "SELECT chest_id FROM chest WHERE chest_name LIKE %s"
             chest_results = await execute_query_with_retry(chest_query, (f"%{rarity}%",))
-            
+
             if not chest_results:
                 await ctx.send(f"Chest rarity '{rarity}' doesn't exist.")
                 return
-                
+
             chest_id = chest_results[0]['chest_id']
-            
-            # Check if chest exists in inventory
-            check_chest_query = "SELECT quantiter FROM inventory_chest WHERE inventory_id = %s AND chest_id = %s"
-            existing_chest = await execute_query_with_retry(check_chest_query, (inventory_id, chest_id))
-            
-            if existing_chest:
-                # Update existing chest quantity
-                update_query = "UPDATE inventory_chest SET quantiter = quantiter + %s WHERE inventory_id = %s AND chest_id = %s"
-                await execute_query_with_retry(update_query, (quantity, inventory_id, chest_id))
-                await ctx.send(f"Added {quantity} {rarity} chest(s) to user {discord_id}'s inventory.")
-            else:
-                # Insert new chest entry
-                insert_query = "INSERT INTO inventory_chest (inventory_id, chest_id, quantiter) VALUES (%s, %s, %s)"
-                await execute_query_with_retry(insert_query, (inventory_id, chest_id, quantity))
-                await ctx.send(f"Added {quantity} {rarity} chest(s) to user {discord_id}'s inventory (new item).")
-                
+
+            async with db_advisory_lock(f"slbot:admin_grant:{user_id}", timeout=5):
+                async with db_transaction():
+                    inventory_id = await get_inventory_id_for_user(user_id)
+                    if inventory_id is None:
+                        await ctx.send(f"User with Discord ID {discord_id} doesn't have an inventory.")
+                        return
+                    await add_inventory_quantity("inventory_chest", inventory_id, chest_id, quantity)
+
+            await ctx.send(f"Added {quantity} {rarity} chest(s) to user {discord_id}'s inventory.")
+
         except ValueError:
             await ctx.send("Invalid format. Please use: `sl givechest rarity,discord_id,quantity`")
         except Exception as e:
@@ -1275,70 +1251,55 @@ class UserCommands(commands.Cog):
     @commands.command(name="giveproduct")
     async def give_product(self, ctx, *, args=None):
         # Check if command user is authorized
-        if str(ctx.author.id) not in ("818132161534230559","1384189515199021127", "1076303866854899762", "1204879494901407805"):
+        if str(ctx.author.id) not in ("818132161534230559","1159962065432236162","1384189515199021127", "1076303866854899762", "1204879494901407805"):
             return  # Silently ignore if not authorized
-            
+
         if args is None:
             await ctx.send("Please use format: `sl giveproduct product_name,discord_id,quantity`")
             return
-            
+
         try:
             # Split arguments by comma
             parts = [part.strip() for part in args.split(',')]
-            
+
             if len(parts) < 2:
                 await ctx.send("Please use format: `sl giveproduct product_name,discord_id,quantity`")
                 return
-                
+
             product_name = parts[0]
             discord_id = parts[1]
             quantity = int(parts[2]) if len(parts) > 2 else 1
-            
+
             # Check if user exists in database by Discord ID
             check_user_query = "SELECT user_id FROM user WHERE user_authorid = %s"
             user_results = await execute_query_with_retry(check_user_query, (discord_id,))
-            
+
             if not user_results:
                 await ctx.send(f"User with Discord ID {discord_id} is not registered in the database.")
                 return
-                
+
             user_id = user_results[0]['user_id']
-            
-            # Get the inventory_id for the user
-            inventory_query = "SELECT inventory_id FROM inventory WHERE user_id = %s"
-            inventory_results = await execute_query_with_retry(inventory_query, (user_id,))
-            
-            if not inventory_results:
-                await ctx.send(f"User with Discord ID {discord_id} doesn't have an inventory.")
-                return
-                
-            inventory_id = inventory_results[0]['inventory_id']
-            
+
             # Check if product exists using LIKE
             product_query = "SELECT product_id FROM product WHERE product_name LIKE %s"
             product_results = await execute_query_with_retry(product_query, (f"%{product_name}%",))
-            
+
             if not product_results:
                 await ctx.send(f"Product '{product_name}' doesn't exist.")
                 return
-                
+
             product_id = product_results[0]['product_id']
-            
-            # Check if product exists in inventory
-            check_product_query = "SELECT quantiter FROM inventory_product WHERE inventory_id = %s AND product_id = %s"
-            existing_product = await execute_query_with_retry(check_product_query, (inventory_id, product_id))
-            
-            if existing_product:
-                # Update existing product quantity
-                update_query = "UPDATE inventory_product SET quantiter = quantiter + %s WHERE inventory_id = %s AND product_id = %s"
-                await execute_query_with_retry(update_query, (quantity, inventory_id, product_id))
-                await ctx.send(f"Added {quantity} {product_name}(s) to user {discord_id}'s inventory.")
-            else:
-                # Insert new product entry
-                insert_query = "INSERT INTO inventory_product (inventory_id, product_id, quantiter) VALUES (%s, %s, %s)"
-                await execute_query_with_retry(insert_query, (inventory_id, product_id, quantity))
-                await ctx.send(f"Added {quantity} {product_name}(s) to user {discord_id}'s inventory (new item).")
-                
+
+            async with db_advisory_lock(f"slbot:admin_grant:{user_id}", timeout=5):
+                async with db_transaction():
+                    inventory_id = await get_inventory_id_for_user(user_id)
+                    if inventory_id is None:
+                        await ctx.send(f"User with Discord ID {discord_id} doesn't have an inventory.")
+                        return
+                    await add_inventory_quantity("inventory_product", inventory_id, product_id, quantity)
+
+            await ctx.send(f"Added {quantity} {product_name}(s) to user {discord_id}'s inventory.")
+
         except ValueError:
             await ctx.send("Invalid format. Please use: `sl giveproduct product_name,discord_id,quantity`")
         except Exception as e:
@@ -1347,489 +1308,55 @@ class UserCommands(commands.Cog):
     @commands.command(name="giveweapon")
     async def give_weapon(self, ctx, *, args=None):
         # Check if command user is authorized
-        if str(ctx.author.id) not in ("818132161534230559","1384189515199021127", "1076303866854899762", "1204879494901407805"):
+        if str(ctx.author.id) not in ("818132161534230559","1159962065432236162","1384189515199021127", "1076303866854899762", "1204879494901407805"):
             return  # Silently ignore if not authorized
-            
+
         if args is None:
             await ctx.send("Please use format: `sl giveweapon weapon_name,discord_id,quantity`")
             return
-            
+
         try:
             # Split arguments by comma
             parts = [part.strip() for part in args.split(',')]
-            
+
             if len(parts) < 2:
                 await ctx.send("Please use format: `sl giveweapon weapon_name,discord_id,quantity`")
                 return
-                
+
             weapon_name = parts[0]
             discord_id = parts[1]
             quantity = int(parts[2]) if len(parts) > 2 else 1
-            
+
             # Check if user exists in database by Discord ID
             check_user_query = "SELECT user_id FROM user WHERE user_authorid = %s"
             user_results = await execute_query_with_retry(check_user_query, (discord_id,))
-            
+
             if not user_results:
                 await ctx.send(f"User with Discord ID {discord_id} is not registered in the database.")
                 return
-                
+
             user_id = user_results[0]['user_id']
-            
-            # Get the inventory_id for the user
-            inventory_query = "SELECT inventory_id FROM inventory WHERE user_id = %s"
-            inventory_results = await execute_query_with_retry(inventory_query, (user_id,))
-            
-            if not inventory_results:
-                await ctx.send(f"User with Discord ID {discord_id} doesn't have an inventory.")
-                return
-                
-            inventory_id = inventory_results[0]['inventory_id']
-            
+
             # Check if weapon exists using LIKE
             weapon_query = "SELECT weapon_id FROM weapon WHERE weapon_name LIKE %s"
             weapon_results = await execute_query_with_retry(weapon_query, (f"%{weapon_name}%",))
-            
+
             if not weapon_results:
                 await ctx.send(f"Weapon '{weapon_name}' doesn't exist.")
                 return
-                
+
             weapon_id = weapon_results[0]['weapon_id']
-            
-            # Check if weapon exists in inventory
-            check_weapon_query = "SELECT quantiter FROM inventory_weapon WHERE inventory_id = %s AND weapon_id = %s"
-            existing_weapon = await execute_query_with_retry(check_weapon_query, (inventory_id, weapon_id))
-            
-            if existing_weapon:
-                # Update existing weapon quantity
-                update_query = "UPDATE inventory_weapon SET quantiter = quantiter + %s WHERE inventory_id = %s AND weapon_id = %s"
-                await execute_query_with_retry(update_query, (quantity, inventory_id, weapon_id))
-                await ctx.send(f"Added {quantity} {weapon_name}(s) to user {discord_id}'s inventory.")
-            else:
-                # Insert new weapon entry
-                insert_query = "INSERT INTO inventory_weapon (inventory_id, weapon_id, quantiter) VALUES (%s, %s, %s)"
-                await execute_query_with_retry(insert_query, (inventory_id, weapon_id, quantity))
-                await ctx.send(f"Added {quantity} {weapon_name}(s) to user {discord_id}'s inventory (new item).")
-                
-        except ValueError:
-            await ctx.send("Invalid format. Please use: `sl giveweapon weapon_name,discord_id,quantity`")
-        except Exception as e:
-            await ctx.send(f"Error: {str(e)}")
-async def setup(bot):
-    await bot.add_cog(UserCommands(bot))
-    @commands.command(name="giveboost")
-    async def give_itemboost(self, ctx, user: discord.Member = None, amount: int = 1):
-        # Check if command user is authorized
-        if str(ctx.author.id) not in ("818132161534230559","1384189515199021127", "1076303866854899762", "1204879494901407805"):
-            return  # Silently ignore if not authorized
-            
-        if user is None:
-            await ctx.send("Please specify a user: `sl give @user [amount]`")
-            return
-            
-        try:
-            # Check if user exists in database by Discord ID
-            check_user_query = "SELECT user_id FROM user WHERE user_authorid = %s"
-            user_results = await execute_query_with_retry(check_user_query, (str(user.id),))
-            
-            if not user_results:
-                await ctx.send(f"User {user.mention} is not registered in the database.")
-                return
-                
-            user_id = user_results[0]['user_id']
-            
-            # Get the inventory_id for the user
-            inventory_query = "SELECT inventory_id FROM inventory WHERE user_id = %s"
-            inventory_results = await execute_query_with_retry(inventory_query, (user_id,))
-            
-            if not inventory_results:
-                await ctx.send(f"User {user.mention} doesn't have an inventory.")
-                return
-                
-            inventory_id = inventory_results[0]['inventory_id']
-            
-            # Check if product_id 2 exists for this inventory
-            check_product_query = "SELECT quantiter FROM inventory_product WHERE inventory_id = %s AND product_id = 1"
-            product_results = await execute_query_with_retry(check_product_query, (inventory_id,))
-            
-            if product_results:
-                # Update existing product quantity
-                update_query = "UPDATE inventory_product SET quantiter = quantiter + %s WHERE inventory_id = %s AND product_id = 1"
-                await execute_query_with_retry(update_query, (amount, inventory_id))
-                await ctx.send(f"Added {amount} item(s) to {user.mention}'s inventory.")
-            else:
-                # Insert new product entry
-                insert_query = "INSERT INTO inventory_product (inventory_id, product_id, quantiter) VALUES (%s, 1, %s)"
-                await execute_query_with_retry(insert_query, (inventory_id, amount))
-                await ctx.send(f"Added {amount} item(s) to {user.mention}'s inventory (new item).")
-                
-        except Exception as e:
-            await ctx.send(f"Error: {str(e)}")
 
-    @commands.command(name="ggive")
-    async def give_gwoncurrency(self, ctx, user: discord.Member = None, amount: int = None):
-        # Check if command user is authorized
-        if str(ctx.author.id) not in ("818132161534230559", "1384189515199021127","1076303866854899762", "1204879494901407805"):
-            return  # Silently ignore if not authorized
-            
-        if user is None:
-            await ctx.send("Please specify a user: `sl wgive @user amount`")
-            return
-            
-        if amount is None:
-            await ctx.send("Please specify an amount: `sl wgive @user amount`")
-            return
-        
-        try:
-            # Check if user exists in database by Discord ID
-            check_user_query = "SELECT user_id FROM user WHERE user_authorid = %s"
-            user_results = await execute_query_with_retry(check_user_query, (str(user.id),))
-            
-            if not user_results:
-                await ctx.send(f"User {user.mention} is not registered in the database.")
-                return
-                
-            user_id = user_results[0]['user_id']
-            
-            # Update user's won_currency
-            update_query = "UPDATE user SET gamble_currency = gamble_currency + %s WHERE user_id = %s"
-            await execute_query_with_retry(update_query, (amount, user_id))
-            
-            await ctx.send(f"Added {amount} currency to {user.mention}'s account.")
-            
-        except Exception as e:
-            await ctx.send(f"Error: {str(e)}")
-    @commands.command(name="give")
-    async def give_item(self, ctx, user: discord.Member = None, amount: int = 1):
-        # Check if command user is authorized
-        if str(ctx.author.id) not in ("818132161534230559", "1384189515199021127","1076303866854899762", "1204879494901407805"):
-            return  # Silently ignore if not authorized
-            
-        if user is None:
-            await ctx.send("Please specify a user: `sl give @user [amount]`")
-            return
-            
-        try:
-            # Check if user exists in database by Discord ID
-            check_user_query = "SELECT user_id FROM user WHERE user_authorid = %s"
-            user_results = await execute_query_with_retry(check_user_query, (str(user.id),))
-            
-            if not user_results:
-                await ctx.send(f"User {user.mention} is not registered in the database.")
-                return
-                
-            user_id = user_results[0]['user_id']
-            
-            # Get the inventory_id for the user
-            inventory_query = "SELECT inventory_id FROM inventory WHERE user_id = %s"
-            inventory_results = await execute_query_with_retry(inventory_query, (user_id,))
-            
-            if not inventory_results:
-                await ctx.send(f"User {user.mention} doesn't have an inventory.")
-                return
-                
-            inventory_id = inventory_results[0]['inventory_id']
-            
-            # Check if product_id 2 exists for this inventory
-            check_product_query = "SELECT quantiter FROM inventory_product WHERE inventory_id = %s AND product_id = 2"
-            product_results = await execute_query_with_retry(check_product_query, (inventory_id,))
-            
-            if product_results:
-                # Update existing product quantity
-                update_query = "UPDATE inventory_product SET quantiter = quantiter + %s WHERE inventory_id = %s AND product_id = 2"
-                await execute_query_with_retry(update_query, (amount, inventory_id))
-                await ctx.send(f"Added {amount} item(s) to {user.mention}'s inventory.")
-            else:
-                # Insert new product entry
-                insert_query = "INSERT INTO inventory_product (inventory_id, product_id, quantiter) VALUES (%s, 2, %s)"
-                await execute_query_with_retry(insert_query, (inventory_id, amount))
-                await ctx.send(f"Added {amount} item(s) to {user.mention}'s inventory (new item).")
-                
-        except Exception as e:
-            await ctx.send(f"Error: {str(e)}")
+            async with db_advisory_lock(f"slbot:admin_grant:{user_id}", timeout=5):
+                async with db_transaction():
+                    inventory_id = await get_inventory_id_for_user(user_id)
+                    if inventory_id is None:
+                        await ctx.send(f"User with Discord ID {discord_id} doesn't have an inventory.")
+                        return
+                    await add_inventory_quantity("inventory_weapon", inventory_id, weapon_id, quantity)
 
-    @commands.command(name="wgive")
-    async def give_currency(self, ctx, user: discord.Member = None, amount: int = None):
-        # Check if command user is authorized
-        if str(ctx.author.id) not in ("818132161534230559","1384189515199021127", "1076303866854899762", "1204879494901407805"):
-            return  # Silently ignore if not authorized
-            
-        if user is None:
-            await ctx.send("Please specify a user: `sl wgive @user amount`")
-            return
-            
-        if amount is None:
-            await ctx.send("Please specify an amount: `sl wgive @user amount`")
-            return
-        
-        try:
-            # Check if user exists in database by Discord ID
-            check_user_query = "SELECT user_id FROM user WHERE user_authorid = %s"
-            user_results = await execute_query_with_retry(check_user_query, (str(user.id),))
-            
-            if not user_results:
-                await ctx.send(f"User {user.mention} is not registered in the database.")
-                return
-                
-            user_id = user_results[0]['user_id']
-            
-            # Update user's won_currency
-            update_query = "UPDATE user SET won_currency = won_currency + %s WHERE user_id = %s"
-            await execute_query_with_retry(update_query, (amount, user_id))
-            
-            await ctx.send(f"Added {amount} currency to {user.mention}'s account.")
-            
-        except Exception as e:
-            await ctx.send(f"Error: {str(e)}")
+            await ctx.send(f"Added {quantity} {weapon_name}(s) to user {discord_id}'s inventory.")
 
-    #@commands.command(name="registerdbstats")
-    async def db_stats(self, ctx):
-        """Display database connection statistics"""
-        # Check if the command invoker is authorized
-        if str(ctx.author.id) != "818132161534230559" and not ctx.author.guild_permissions.administrator:
-            await ctx.send("You don't have permission to use this command.")
-            return
-        
-        try:
-            metrics = get_metrics()
-            
-            embed = discord.Embed(
-                title="📊 Database Connection Statistics",
-                color=discord.Color.blue()
-            )
-            
-            embed.add_field(name="Active Connections", value=str(metrics["active_connections"]), inline=True)
-            embed.add_field(name="Peak Connections", value=str(metrics["peak_connections"]), inline=True)
-            embed.add_field(name="Connection Errors", value=str(metrics["connection_errors"]), inline=True)
-            
-            embed.add_field(name="Total Queries", value=str(metrics["total_queries"]), inline=True)
-            embed.add_field(name="Slow Queries", value=f"{metrics['slow_queries']} ({metrics['slow_query_percentage']:.1f}%)", inline=True)
-            embed.add_field(name="Avg Query Time", value=f"{metrics['avg_query_time']:.2f}ms", inline=True)
-            
-            if metrics["last_error"]:
-                error_time = metrics["last_error_time"].strftime("%Y-%m-%d %H:%M:%S") if metrics["last_error_time"] else "Unknown"
-                embed.add_field(
-                    name="Last Error",
-                    value=f"Time: {error_time}\nError: {metrics['last_error'][:100]}...",
-                    inline=False
-                )
-            
-            embed.set_footer(text=f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-            await ctx.send(embed=embed)
-            
-        except Exception as e:
-            await ctx.send(f"An error occurred: {str(e)}")
-    @commands.command(name="givechest")
-    async def give_chest(self, ctx, *, args=None):
-        # Check if command user is authorized
-        if str(ctx.author.id) not in ("818132161534230559","1384189515199021127", "1076303866854899762", "1204879494901407805"):
-            return  # Silently ignore if not authorized
-            
-        if args is None:
-            await ctx.send("Please use format: `sl givechest rarity,discord_id,quantity`")
-            return
-            
-        try:
-            # Split arguments by comma
-            parts = [part.strip() for part in args.split(',')]
-            
-            if len(parts) < 2:
-                await ctx.send("Please use format: `sl givechest rarity,discord_id,quantity`")
-                return
-                
-            rarity = parts[0]
-            discord_id = parts[1]
-            quantity = int(parts[2]) if len(parts) > 2 else 1
-            
-            # Check if user exists in database by Discord ID
-            check_user_query = "SELECT user_id FROM user WHERE user_authorid = %s"
-            user_results = await execute_query_with_retry(check_user_query, (discord_id,))
-            
-            if not user_results:
-                await ctx.send(f"User with Discord ID {discord_id} is not registered in the database.")
-                return
-                
-            user_id = user_results[0]['user_id']
-            
-            # Get the inventory_id for the user
-            inventory_query = "SELECT inventory_id FROM inventory WHERE user_id = %s"
-            inventory_results = await execute_query_with_retry(inventory_query, (user_id,))
-            
-            if not inventory_results:
-                await ctx.send(f"User with Discord ID {discord_id} doesn't have an inventory.")
-                return
-                
-            inventory_id = inventory_results[0]['inventory_id']
-            
-            # Check if chest rarity exists using LIKE
-            chest_query = "SELECT chest_id FROM chest WHERE chest_name LIKE %s"
-            chest_results = await execute_query_with_retry(chest_query, (f"%{rarity}%",))
-            
-            if not chest_results:
-                await ctx.send(f"Chest rarity '{rarity}' doesn't exist.")
-                return
-                
-            chest_id = chest_results[0]['chest_id']
-            
-            # Check if chest exists in inventory
-            check_chest_query = "SELECT quantiter FROM inventory_chest WHERE inventory_id = %s AND chest_id = %s"
-            existing_chest = await execute_query_with_retry(check_chest_query, (inventory_id, chest_id))
-            
-            if existing_chest:
-                # Update existing chest quantity
-                update_query = "UPDATE inventory_chest SET quantiter = quantiter + %s WHERE inventory_id = %s AND chest_id = %s"
-                await execute_query_with_retry(update_query, (quantity, inventory_id, chest_id))
-                await ctx.send(f"Added {quantity} {rarity} chest(s) to user {discord_id}'s inventory.")
-            else:
-                # Insert new chest entry
-                insert_query = "INSERT INTO inventory_chest (inventory_id, chest_id, quantiter) VALUES (%s, %s, %s)"
-                await execute_query_with_retry(insert_query, (inventory_id, chest_id, quantity))
-                await ctx.send(f"Added {quantity} {rarity} chest(s) to user {discord_id}'s inventory (new item).")
-                
-        except ValueError:
-            await ctx.send("Invalid format. Please use: `sl givechest rarity,discord_id,quantity`")
-        except Exception as e:
-            await ctx.send(f"Error: {str(e)}")
-
-    @commands.command(name="giveproduct")
-    async def give_product(self, ctx, *, args=None):
-        # Check if command user is authorized
-        if str(ctx.author.id) not in ("818132161534230559","1384189515199021127", "1076303866854899762", "1204879494901407805"):
-            return  # Silently ignore if not authorized
-            
-        if args is None:
-            await ctx.send("Please use format: `sl giveproduct product_name,discord_id,quantity`")
-            return
-            
-        try:
-            # Split arguments by comma
-            parts = [part.strip() for part in args.split(',')]
-            
-            if len(parts) < 2:
-                await ctx.send("Please use format: `sl giveproduct product_name,discord_id,quantity`")
-                return
-                
-            product_name = parts[0]
-            discord_id = parts[1]
-            quantity = int(parts[2]) if len(parts) > 2 else 1
-            
-            # Check if user exists in database by Discord ID
-            check_user_query = "SELECT user_id FROM user WHERE user_authorid = %s"
-            user_results = await execute_query_with_retry(check_user_query, (discord_id,))
-            
-            if not user_results:
-                await ctx.send(f"User with Discord ID {discord_id} is not registered in the database.")
-                return
-                
-            user_id = user_results[0]['user_id']
-            
-            # Get the inventory_id for the user
-            inventory_query = "SELECT inventory_id FROM inventory WHERE user_id = %s"
-            inventory_results = await execute_query_with_retry(inventory_query, (user_id,))
-            
-            if not inventory_results:
-                await ctx.send(f"User with Discord ID {discord_id} doesn't have an inventory.")
-                return
-                
-            inventory_id = inventory_results[0]['inventory_id']
-            
-            # Check if product exists using LIKE
-            product_query = "SELECT product_id FROM product WHERE product_name LIKE %s"
-            product_results = await execute_query_with_retry(product_query, (f"%{product_name}%",))
-            
-            if not product_results:
-                await ctx.send(f"Product '{product_name}' doesn't exist.")
-                return
-                
-            product_id = product_results[0]['product_id']
-            
-            # Check if product exists in inventory
-            check_product_query = "SELECT quantiter FROM inventory_product WHERE inventory_id = %s AND product_id = %s"
-            existing_product = await execute_query_with_retry(check_product_query, (inventory_id, product_id))
-            
-            if existing_product:
-                # Update existing product quantity
-                update_query = "UPDATE inventory_product SET quantiter = quantiter + %s WHERE inventory_id = %s AND product_id = %s"
-                await execute_query_with_retry(update_query, (quantity, inventory_id, product_id))
-                await ctx.send(f"Added {quantity} {product_name}(s) to user {discord_id}'s inventory.")
-            else:
-                # Insert new product entry
-                insert_query = "INSERT INTO inventory_product (inventory_id, product_id, quantiter) VALUES (%s, %s, %s)"
-                await execute_query_with_retry(insert_query, (inventory_id, product_id, quantity))
-                await ctx.send(f"Added {quantity} {product_name}(s) to user {discord_id}'s inventory (new item).")
-                
-        except ValueError:
-            await ctx.send("Invalid format. Please use: `sl giveproduct product_name,discord_id,quantity`")
-        except Exception as e:
-            await ctx.send(f"Error: {str(e)}")
-
-    @commands.command(name="giveweapon")
-    async def give_weapon(self, ctx, *, args=None):
-        # Check if command user is authorized
-        if str(ctx.author.id) not in ("818132161534230559","1384189515199021127", "1076303866854899762", "1204879494901407805"):
-            return  # Silently ignore if not authorized
-            
-        if args is None:
-            await ctx.send("Please use format: `sl giveweapon weapon_name,discord_id,quantity`")
-            return
-            
-        try:
-            # Split arguments by comma
-            parts = [part.strip() for part in args.split(',')]
-            
-            if len(parts) < 2:
-                await ctx.send("Please use format: `sl giveweapon weapon_name,discord_id,quantity`")
-                return
-                
-            weapon_name = parts[0]
-            discord_id = parts[1]
-            quantity = int(parts[2]) if len(parts) > 2 else 1
-            
-            # Check if user exists in database by Discord ID
-            check_user_query = "SELECT user_id FROM user WHERE user_authorid = %s"
-            user_results = await execute_query_with_retry(check_user_query, (discord_id,))
-            
-            if not user_results:
-                await ctx.send(f"User with Discord ID {discord_id} is not registered in the database.")
-                return
-                
-            user_id = user_results[0]['user_id']
-            
-            # Get the inventory_id for the user
-            inventory_query = "SELECT inventory_id FROM inventory WHERE user_id = %s"
-            inventory_results = await execute_query_with_retry(inventory_query, (user_id,))
-            
-            if not inventory_results:
-                await ctx.send(f"User with Discord ID {discord_id} doesn't have an inventory.")
-                return
-                
-            inventory_id = inventory_results[0]['inventory_id']
-            
-            # Check if weapon exists using LIKE
-            weapon_query = "SELECT weapon_id FROM weapon WHERE weapon_name LIKE %s"
-            weapon_results = await execute_query_with_retry(weapon_query, (f"%{weapon_name}%",))
-            
-            if not weapon_results:
-                await ctx.send(f"Weapon '{weapon_name}' doesn't exist.")
-                return
-                
-            weapon_id = weapon_results[0]['weapon_id']
-            
-            # Check if weapon exists in inventory
-            check_weapon_query = "SELECT quantiter FROM inventory_weapon WHERE inventory_id = %s AND weapon_id = %s"
-            existing_weapon = await execute_query_with_retry(check_weapon_query, (inventory_id, weapon_id))
-            
-            if existing_weapon:
-                # Update existing weapon quantity
-                update_query = "UPDATE inventory_weapon SET quantiter = quantiter + %s WHERE inventory_id = %s AND weapon_id = %s"
-                await execute_query_with_retry(update_query, (quantity, inventory_id, weapon_id))
-                await ctx.send(f"Added {quantity} {weapon_name}(s) to user {discord_id}'s inventory.")
-            else:
-                # Insert new weapon entry
-                insert_query = "INSERT INTO inventory_weapon (inventory_id, weapon_id, quantiter) VALUES (%s, %s, %s)"
-                await execute_query_with_retry(insert_query, (inventory_id, weapon_id, quantity))
-                await ctx.send(f"Added {quantity} {weapon_name}(s) to user {discord_id}'s inventory (new item).")
-                
         except ValueError:
             await ctx.send("Invalid format. Please use: `sl giveweapon weapon_name,discord_id,quantity`")
         except Exception as e:

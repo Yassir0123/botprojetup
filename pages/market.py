@@ -8,6 +8,8 @@ import asyncio
 import time
 import re
 from utils.database import execute_query_with_retry, get_metrics
+from utils.activity_state import block_during_user_activity, claim_user_status_row
+from utils.db_atomic import db_transaction
 import functools
 
 MAIN_SHOP_IMAGE = "https://static0.gamerantimages.com/wordpress/wp-content/uploads/2025/05/jinwoo-shop.jpg?q=49&fit=crop&w=825&dpr=2"
@@ -188,92 +190,74 @@ class PriceModal(discord.ui.Modal, title='Set Your Listing Price'):
                     else:  # 50%-80% or 120%-200% range
                         tax_rate = 30  # 30% tax
            
-            # Insert into market table
             table_map = {
-                'weapon': 'market_weapon',
-                'booster': 'market_booster',
-                'dungeonkey': 'market_dungeonkey',
-                'fragments': 'market_fragments'
+                'weapon': ('market_weapon', 'listing_weapon', 'inventory_weapon', 'weapon_id'),
+                'booster': ('market_booster', 'listing_booster', 'inventory_product', 'product_id'),
+                'dungeonkey': ('market_dungeonkey', 'listing_dungeonkey', 'inventory_dungeonkey', 'dungeonkey_id'),
+                'fragments': ('market_fragments', 'listing_fragments', 'inventory_frags', 'frag_id')
             }
-           
-            market_table = table_map[category]
-           
-            market_insert = f"""
-            INSERT INTO {market_table} (user_id, total_price, position, tax)
-            VALUES (%s, %s, 0, %s)
-            """
-            await execute_query_with_retry(market_insert, (user_id, total_price, tax_rate))
-           
-            # Get the newly created id_market
-            get_id_query = f"""
-            SELECT MAX(id_market) as id_market
-            FROM {market_table}
-            WHERE user_id = %s
-            """
-            id_result = await execute_query_with_retry(get_id_query, (user_id,))
-            id_market = id_result[0]["id_market"]
-           
-            # Insert listing items and update inventory
-            for item in listing:
-                item_id = item['id']
-                quantity = item['quantity']
-               
-                # Insert into listing table
-                if category == 'weapon':
-                    listing_insert = """
-                    INSERT INTO listing_weapon (id_market, weapon_id, sell_quantity)
-                    VALUES (%s, %s, %s)
-                    """
-                    await execute_query_with_retry(listing_insert, (id_market, item_id, quantity))
-                    inventory_table = 'inventory_weapon'
-                    id_field = 'weapon_id'
-                elif category == 'booster':
-                    listing_insert = """
-                    INSERT INTO listing_booster (id_market, product_id, sell_quantity)
-                    VALUES (%s, %s, %s)
-                    """
-                    await execute_query_with_retry(listing_insert, (id_market, item_id, quantity))
-                    inventory_table = 'inventory_product'
-                    id_field = 'product_id'
-                elif category == 'dungeonkey':
-                    listing_insert = """
-                    INSERT INTO listing_dungeonkey (id_market, dungeonkey_id, sell_quantity)
-                    VALUES (%s, %s, %s)
-                    """
-                    await execute_query_with_retry(listing_insert, (id_market, item_id, quantity))
-                    inventory_table = 'inventory_dungeonkey'
-                    id_field = 'dungeonkey_id'
-                elif category == 'fragments':
-                    listing_insert = """
-                    INSERT INTO listing_fragments (id_market, id_fragment, sell_quantity)
-                    VALUES (%s, %s, %s)
-                    """
-                    await execute_query_with_retry(listing_insert, (id_market, item_id, quantity))
-                    inventory_table = 'inventory_frags'
-                    id_field = 'frag_id'
-               
-                # Update user's inventory
-                check_query = f"""
-                SELECT quantiter
-                FROM {inventory_table}
-                WHERE inventory_id = %s AND {id_field} = %s
-                """
-                current_result = await execute_query_with_retry(check_query, (inventory_id, item_id))
-                current_quantity = current_result[0]["quantiter"]
-               
-                if current_quantity == quantity:
-                    delete_query = f"""
-                    DELETE FROM {inventory_table}
-                    WHERE inventory_id = %s AND {id_field} = %s
-                    """
-                    await execute_query_with_retry(delete_query, (inventory_id, item_id))
-                else:
-                    update_query = f"""
-                    UPDATE {inventory_table}
-                    SET quantiter = quantiter - %s
-                    WHERE inventory_id = %s AND {id_field} = %s
-                    """
-                    await execute_query_with_retry(update_query, (quantity, inventory_id, item_id))
+
+            market_table, listing_table, inventory_table, id_field = table_map[category]
+            listing_id_field = 'id_fragment' if category == 'fragments' else id_field
+
+            async with db_transaction() as tx:
+                inventory_row = await tx.fetchone(
+                    "SELECT inventory_id FROM inventory WHERE inventory_id = %s AND user_id = %s FOR UPDATE",
+                    (inventory_id, user_id)
+                )
+                if not inventory_row:
+                    raise RuntimeError("Inventory not found for market listing.")
+
+                for item in listing:
+                    current_result = await tx.fetchone(
+                        f"""
+                        SELECT quantiter
+                        FROM {inventory_table}
+                        WHERE inventory_id = %s AND {id_field} = %s
+                        FOR UPDATE
+                        """,
+                        (inventory_id, item['id'])
+                    )
+                    if not current_result or current_result["quantiter"] < item['quantity']:
+                        raise RuntimeError("Not enough inventory quantity for market listing.")
+
+                await tx.execute(
+                    f"INSERT INTO {market_table} (user_id, total_price, position, tax) VALUES (%s, %s, 0, %s)",
+                    (user_id, total_price, tax_rate)
+                )
+                id_result = await tx.fetchone("SELECT LAST_INSERT_ID() as id_market")
+                id_market = id_result["id_market"]
+
+                for item in listing:
+                    item_id = item['id']
+                    quantity = item['quantity']
+
+                    await tx.execute(
+                        f"INSERT INTO {listing_table} (id_market, {listing_id_field}, sell_quantity) VALUES (%s, %s, %s)",
+                        (id_market, item_id, quantity)
+                    )
+
+                    current_result = await tx.fetchone(
+                        f"""
+                        SELECT quantiter
+                        FROM {inventory_table}
+                        WHERE inventory_id = %s AND {id_field} = %s
+                        FOR UPDATE
+                        """,
+                        (inventory_id, item_id)
+                    )
+                    current_quantity = current_result["quantiter"]
+
+                    if current_quantity == quantity:
+                        await tx.execute(
+                            f"DELETE FROM {inventory_table} WHERE inventory_id = %s AND {id_field} = %s",
+                            (inventory_id, item_id)
+                        )
+                    else:
+                        await tx.execute(
+                            f"UPDATE {inventory_table} SET quantiter = quantiter - %s WHERE inventory_id = %s AND {id_field} = %s",
+                            (quantity, inventory_id, item_id)
+                        )
            
             return True
            
@@ -513,11 +497,7 @@ class MarketCommands(commands.Cog):
        
     async def add_user_to_market_session(self, user_id):
         """Add user to market_session table"""
-        try:
-            insert_query = "INSERT INTO market_session (user_id) VALUES (%s)"
-            await execute_query_with_retry(insert_query, (user_id,))
-        except Exception as e:
-            print(f"Error adding user to market session: {e}")
+        return await claim_user_status_row("market_session", user_id)
 
     async def remove_user_from_market_session(self, user_id):
         """Remove user from market_session table"""
@@ -956,6 +936,7 @@ class MarketCommands(commands.Cog):
 
 
     @commands.command(name='mcreate', aliases=["mcr", "mkr"])
+    @block_during_user_activity(get_user_multilanguage)
     async def market_create(self, ctx):
         """Create a new market listing"""
         lang = await get_user_multilanguage(ctx.author.id)
@@ -976,7 +957,14 @@ class MarketCommands(commands.Cog):
             await ctx.send(f"⚠️ {message}")
             return
 
-        await self.add_user_to_market_session(user_id)
+        if not await self.add_user_to_market_session(user_id):
+            await ctx.send(_tr(
+                lang,
+                "⚠️ You are already creating a market listing.",
+                "⚠️ أنت تقوم بإنشاء عرض في السوق بالفعل.",
+                "⚠️ Vous créez déjà une annonce sur le marché."
+            ))
+            return
 
         # Get user's inventory_id
         try:
@@ -1038,6 +1026,7 @@ class MarketCommands(commands.Cog):
                 pass
 
     @commands.command(name='madd')
+    @block_during_user_activity(get_user_multilanguage)
     async def market_add_item(self, ctx, *, args):
         """Add item to current market listing"""
         lang = await get_user_multilanguage(ctx.author.id)
@@ -1082,6 +1071,7 @@ class MarketCommands(commands.Cog):
             await self.add_fragment_to_listing(ctx, item_name, quantity, inventory_id, session)
 
     @commands.command(name='mremove')
+    @block_during_user_activity(get_user_multilanguage)
     async def market_remove_item(self, ctx, *, item_name):
         """Remove item from current market listing"""
         lang = await get_user_multilanguage(ctx.author.id)
@@ -1553,6 +1543,7 @@ class MarketCommands(commands.Cog):
 
 
     @commands.command(name='mbuy', aliases=["mb", "mby"])
+    @block_during_user_activity(get_user_multilanguage)
     async def buy_listing(self, ctx, listing_id: str):
         """Buy a listing using the new ID format (e.g., a12, b5, c3, d7)"""
         lang = await get_user_multilanguage(ctx.author.id)
@@ -1786,75 +1777,144 @@ class MarketCommands(commands.Cog):
             return []
 
 
+    async def _complete_purchase_transaction(self, id_market, category, buyer_user_id):
+        table_map = {
+            'weapon': ('market_weapon', 'listing_weapon', 'inventory_weapon', 'weapon_id'),
+            'booster': ('market_booster', 'listing_booster', 'inventory_product', 'product_id'),
+            'dungeonkey': ('market_dungeonkey', 'listing_dungeonkey', 'inventory_dungeonkey', 'dungeonkey_id'),
+            'fragments': ('market_fragments', 'listing_fragments', 'inventory_frags', 'frag_id')
+        }
+        item_selects = {
+            'weapon': """
+                SELECT lw.weapon_id AS id, lw.sell_quantity AS quantity, w.weapon_name AS name, w.weapon_icon AS icon
+                FROM listing_weapon lw
+                JOIN weapon w ON lw.weapon_id = w.weapon_id
+                WHERE lw.id_market = %s
+                FOR UPDATE
+            """,
+            'booster': """
+                SELECT lb.product_id AS id, lb.sell_quantity AS quantity, p.product_name AS name, p.product_icon AS icon
+                FROM listing_booster lb
+                JOIN product p ON lb.product_id = p.product_id
+                WHERE lb.id_market = %s
+                FOR UPDATE
+            """,
+            'dungeonkey': """
+                SELECT ld.dungeonkey_id AS id, ld.sell_quantity AS quantity, dk.dungeonkey_name AS name, dk.dungeonkey_icon AS icon
+                FROM listing_dungeonkey ld
+                JOIN dungeon_key dk ON ld.dungeonkey_id = dk.dungeonkey_id
+                WHERE ld.id_market = %s
+                FOR UPDATE
+            """,
+            'fragments': """
+                SELECT lf.id_fragment AS id, lf.sell_quantity AS quantity, f.name_fragment AS name, f.fragments_icon AS icon
+                FROM listing_fragments lf
+                JOIN fragments f ON lf.id_fragment = f.id_fragment
+                WHERE lf.id_market = %s
+                FOR UPDATE
+            """
+        }
+        market_table, listing_table, inventory_table, item_id_column = table_map[category]
+
+        async with db_transaction() as tx:
+            listing_data = await tx.fetchone(
+                f"""
+                SELECT user_id, total_price, tax
+                FROM {market_table}
+                WHERE id_market = %s
+                FOR UPDATE
+                """,
+                (id_market,)
+            )
+            if not listing_data:
+                return None, "This listing no longer exists. Someone may have already purchased it."
+
+            seller_user_id = listing_data["user_id"]
+            listed_price = listing_data["total_price"]
+            tax_rate = listing_data.get("tax", 0) or 0
+            seller_receives = listed_price if category == 'fragments' or tax_rate == 0 else listed_price - int(listed_price * (tax_rate / 100))
+
+            buyer = await tx.fetchone(
+                "SELECT won_currency FROM user WHERE user_id = %s FOR UPDATE",
+                (buyer_user_id,)
+            )
+            seller = await tx.fetchone(
+                "SELECT user_authorid FROM user WHERE user_id = %s FOR UPDATE",
+                (seller_user_id,)
+            )
+            if not buyer:
+                return None, "Buyer not found"
+            if buyer["won_currency"] < listed_price:
+                return None, "Buyer no longer has enough Won for this listing."
+
+            inventory_result = await tx.fetchone(
+                "SELECT inventory_id FROM inventory WHERE user_id = %s FOR UPDATE",
+                (buyer_user_id,)
+            )
+            if not inventory_result:
+                return None, "Buyer inventory not found"
+            buyer_inventory_id = inventory_result["inventory_id"]
+
+            listing_items = await tx.fetchall(item_selects[category], (id_market,))
+            if not listing_items:
+                return None, "No items found in listing"
+
+            await tx.execute(
+                "UPDATE user SET won_currency = won_currency - %s WHERE user_id = %s",
+                (listed_price, buyer_user_id)
+            )
+            await tx.execute(
+                "UPDATE user SET won_currency = won_currency + %s WHERE user_id = %s",
+                (seller_receives, seller_user_id)
+            )
+
+            for item in listing_items:
+                existing = await tx.fetchone(
+                    f"""
+                    SELECT quantiter
+                    FROM {inventory_table}
+                    WHERE inventory_id = %s AND {item_id_column} = %s
+                    FOR UPDATE
+                    """,
+                    (buyer_inventory_id, item["id"])
+                )
+                if existing:
+                    await tx.execute(
+                        f"UPDATE {inventory_table} SET quantiter = quantiter + %s WHERE inventory_id = %s AND {item_id_column} = %s",
+                        (item["quantity"], buyer_inventory_id, item["id"])
+                    )
+                else:
+                    await tx.execute(
+                        f"INSERT INTO {inventory_table} (inventory_id, {item_id_column}, quantiter) VALUES (%s, %s, %s)",
+                        (buyer_inventory_id, item["id"], item["quantity"])
+                    )
+
+            await tx.execute(f"DELETE FROM {listing_table} WHERE id_market = %s", (id_market,))
+            await tx.execute(f"DELETE FROM {market_table} WHERE id_market = %s", (id_market,))
+
+            return {
+                "seller_user_id": seller_user_id,
+                "seller_discord_id": seller["user_authorid"] if seller else None,
+                "listed_price": listed_price,
+                "seller_receives": seller_receives,
+                "tax_rate": tax_rate,
+                "listing_items": listing_items,
+            }, "Purchase completed successfully"
+
+
     async def complete_purchase(self, id_market, category, total_price, buyer_user_id):
         """Complete the market purchase transaction"""
         try:
-            table_map = {
-                'weapon': 'market_weapon',
-                'booster': 'market_booster',
-                'dungeonkey': 'market_dungeonkey',
-                'fragments': 'market_fragments'
-            }
-            market_table = table_map[category]
+            purchase_data, message = await self._complete_purchase_transaction(id_market, category, buyer_user_id)
+            if not purchase_data:
+                return False, message
 
-            # Check if listing still exists and get tax info
-            existence_check = f"""
-            SELECT user_id, total_price, tax
-            FROM {market_table}
-            WHERE id_market = %s
-            """
-            existence_result = await execute_query_with_retry(existence_check, (id_market,))
-            if not existence_result:
-                return False, "This listing no longer exists. Someone may have already purchased it."
-
-            listing_data = existence_result[0]
-            seller_user_id = listing_data["user_id"]
-            listed_price = listing_data["total_price"]
-            tax_rate = listing_data.get("tax", 0)
-
-            # Calculate amounts
-            if category == 'fragments' or tax_rate == 0:
-                buyer_pays = listed_price
-                seller_receives = listed_price
-            else:
-                tax_amount = int(listed_price * (tax_rate / 100))
-                buyer_pays = listed_price
-                seller_receives = listed_price - tax_amount
-
-            # Buyer's inventory
-            inventory_query = """
-            SELECT inventory_id
-            FROM inventory
-            WHERE user_id = %s
-            """
-            inventory_result = await execute_query_with_retry(inventory_query, (buyer_user_id,))
-            if not inventory_result:
-                return False, "Buyer inventory not found"
-
-            buyer_inventory_id = inventory_result[0]["inventory_id"]
-
-            # Items
-            listing_items = await self.get_listing_items(id_market, category)
-            if not listing_items:
-                return False, "No items found in listing"
-
-            # Seller discord id
-            seller_discord_query = "SELECT user_authorid FROM user WHERE user_id = %s"
-            seller_discord_result = await execute_query_with_retry(seller_discord_query, (seller_user_id,))
-            seller_discord_id = seller_discord_result[0]["user_authorid"] if seller_discord_result else None
-
-            # Transfer currency
-            buyer_update = "UPDATE user SET won_currency = won_currency - %s WHERE user_id = %s"
-            await execute_query_with_retry(buyer_update, (buyer_pays, buyer_user_id))
-
-            seller_update = "UPDATE user SET won_currency = won_currency + %s WHERE user_id = %s"
-            await execute_query_with_retry(seller_update, (seller_receives, seller_user_id))
-
-            # Transfer items to buyer
-            await self.transfer_items_to_buyer(buyer_inventory_id, listing_items, category)
-
-            # Remove listing
-            await self.remove_market_listing(id_market, category)
+            seller_user_id = purchase_data["seller_user_id"]
+            seller_discord_id = purchase_data["seller_discord_id"]
+            listed_price = purchase_data["listed_price"]
+            seller_receives = purchase_data["seller_receives"]
+            tax_rate = purchase_data["tax_rate"]
+            listing_items = purchase_data["listing_items"]
 
             # DM seller (localized to seller's language)
             if seller_discord_id:
@@ -2092,6 +2152,7 @@ class MarketCommands(commands.Cog):
 
 
     @commands.command(name='mdelist', aliases=["mdl", "mds"])
+    @block_during_user_activity(get_user_multilanguage)
     async def delist_listing(self, ctx, listing_id: str):
         """Delist a listing using the new ID format (e.g., a12, b5, c3, d7)"""
         lang = await get_user_multilanguage(ctx.author.id)
@@ -2136,6 +2197,68 @@ class MarketCommands(commands.Cog):
         await self.process_delist(ctx, numeric_id, category)
 
 
+    async def _delist_listing_transaction(self, id_market, category, user_id):
+        table_map = {
+            'weapon': ('market_weapon', 'listing_weapon', 'inventory_weapon', 'weapon_id'),
+            'booster': ('market_booster', 'listing_booster', 'inventory_product', 'product_id'),
+            'dungeonkey': ('market_dungeonkey', 'listing_dungeonkey', 'inventory_dungeonkey', 'dungeonkey_id'),
+            'fragments': ('market_fragments', 'listing_fragments', 'inventory_frags', 'frag_id')
+        }
+        item_selects = {
+            'weapon': "SELECT weapon_id AS id, sell_quantity AS quantity FROM listing_weapon WHERE id_market = %s FOR UPDATE",
+            'booster': "SELECT product_id AS id, sell_quantity AS quantity FROM listing_booster WHERE id_market = %s FOR UPDATE",
+            'dungeonkey': "SELECT dungeonkey_id AS id, sell_quantity AS quantity FROM listing_dungeonkey WHERE id_market = %s FOR UPDATE",
+            'fragments': "SELECT id_fragment AS id, sell_quantity AS quantity FROM listing_fragments WHERE id_market = %s FOR UPDATE"
+        }
+        market_table, listing_table, inventory_table, item_id_column = table_map[category]
+
+        async with db_transaction() as tx:
+            ownership_result = await tx.fetchone(
+                f"""
+                SELECT user_id, total_price
+                FROM {market_table}
+                WHERE id_market = %s AND user_id = %s
+                FOR UPDATE
+                """,
+                (id_market, user_id)
+            )
+            if not ownership_result:
+                return False
+
+            listing_items = await tx.fetchall(item_selects[category], (id_market,))
+            inventory_result = await tx.fetchone(
+                "SELECT inventory_id FROM inventory WHERE user_id = %s FOR UPDATE",
+                (user_id,)
+            )
+            if not inventory_result:
+                raise RuntimeError("Inventory not found for market delist.")
+
+            inventory_id = inventory_result["inventory_id"]
+            for item in listing_items:
+                existing = await tx.fetchone(
+                    f"""
+                    SELECT quantiter
+                    FROM {inventory_table}
+                    WHERE inventory_id = %s AND {item_id_column} = %s
+                    FOR UPDATE
+                    """,
+                    (inventory_id, item["id"])
+                )
+                if existing:
+                    await tx.execute(
+                        f"UPDATE {inventory_table} SET quantiter = quantiter + %s WHERE inventory_id = %s AND {item_id_column} = %s",
+                        (item["quantity"], inventory_id, item["id"])
+                    )
+                else:
+                    await tx.execute(
+                        f"INSERT INTO {inventory_table} (inventory_id, {item_id_column}, quantiter) VALUES (%s, %s, %s)",
+                        (inventory_id, item["id"], item["quantity"])
+                    )
+
+            await tx.execute(f"DELETE FROM {listing_table} WHERE id_market = %s", (id_market,))
+            await tx.execute(f"DELETE FROM {market_table} WHERE id_market = %s AND user_id = %s", (id_market, user_id))
+            return True
+
     async def process_delist(self, ctx, id_market, category):
         """Process delisting for any category"""
         lang = await get_user_multilanguage(ctx.author.id)
@@ -2161,59 +2284,22 @@ class MarketCommands(commands.Cog):
             return
 
         try:
-            table_map = {
-                'weapon': ('market_weapon', 'listing_weapon'),
-                'booster': ('market_booster', 'listing_booster'),
-                'dungeonkey': ('market_dungeonkey', 'listing_dungeonkey'),
-                'fragments': ('market_fragments', 'listing_fragments')
-            }
-
-            market_table, listing_table = table_map[category]
-
-            # Check if user owns this listing
-            ownership_query = f"""
-            SELECT user_id, total_price
-            FROM {market_table}
-            WHERE id_market = %s AND user_id = %s
-            """
-            ownership_result = await execute_query_with_retry(ownership_query, (id_market, user_id))
-
-            if not ownership_result:
+            delisted = await self._delist_listing_transaction(id_market, category, user_id)
+            if not delisted:
                 await ctx.send(_tr(lang,
-                    f"❌ You don't have a listing with ID #{id_market}.",
-                    f"❌ ليست لديك قائمة برقم #{id_market}.",
-                    f"❌ Vous n'avez pas d'annonce avec l'ID #{id_market}."
+                    f"Listing #{id_market} was not found or is not yours.",
+                    f"Listing #{id_market} was not found or is not yours.",
+                    f"Listing #{id_market} was not found or is not yours."
                 ))
                 return
 
-            # Get listing items before deletion for return to inventory
-            listing_items = await self.get_listing_items(id_market, category)
-
-            # Get user's inventory_id
-            inventory_query = """
-            SELECT inventory_id
-            FROM inventory
-            WHERE user_id = %s
-            """
-            inventory_result = await execute_query_with_retry(inventory_query, (user_id,))
-            inventory_id = inventory_result[0]["inventory_id"]
-
-            # Return items to inventory
-            await self.return_items_to_inventory(inventory_id, listing_items, category)
-
-            # Remove from listing table first
-            delete_listing_query = f"DELETE FROM {listing_table} WHERE id_market = %s"
-            await execute_query_with_retry(delete_listing_query, (id_market,))
-
-            # Remove from market table
-            delete_market_query = f"DELETE FROM {market_table} WHERE id_market = %s AND user_id = %s"
-            await execute_query_with_retry(delete_market_query, (id_market, user_id))
-
             await ctx.send(_tr(lang,
-                f"✅ **Listing #{id_market} has been successfully delisted!** Your items have been returned to your inventory.",
-                f"✅ **تمت إزالة القائمة #{id_market} بنجاح!** تمت إعادة عناصرِك إلى جردك.",
-                f"✅ **L'annonce #{id_market} a été retirée avec succès !** Vos objets ont été retournés dans votre inventaire."
+                f"Listing #{id_market} has been successfully delisted. Your items have been returned to your inventory.",
+                f"Listing #{id_market} has been successfully delisted. Your items have been returned to your inventory.",
+                f"Listing #{id_market} has been successfully delisted. Your items have been returned to your inventory."
             ))
+            return
+
 
         except Exception as e:
             await ctx.send(_tr(lang,

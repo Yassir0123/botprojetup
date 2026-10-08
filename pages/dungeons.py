@@ -12,6 +12,11 @@ import logging
 import os
 import traceback
 from utils.database import execute_query_with_retry, get_metrics
+from utils.activity_state import claim_user_activity, cleanup_stale_user_activity, release_user_activity
+from utils.db_atomic import advisory_lock_for_context, db_transaction
+from utils.discord_safe import safe_defer, safe_edit, safe_response_edit, safe_response_send, safe_send
+from utils.error_reporting import compact_card_rows, compact_opponent_rows, send_support_error
+from utils.inventory_ops import add_inventory_quantity
 import functools
 import secrets
 # --- multilanguage helpers ---
@@ -79,7 +84,7 @@ def command_cooldown(rate=1, per=3.0, type=commands.BucketType.user):
                     # Command is on cooldown
                     remaining = round(retry_after, 1)
                     ml = await get_user_multilanguage(ctx.author.id)
-                    await ctx.send(_tr(ml,
+                    await safe_send(ctx, _tr(ml,
                         f"⏰ Command on cooldown. Please wait {remaining} seconds.",
                         f"⏰ الأمر قيد الانتظار. يرجى الانتظار {remaining} ثانية.",
                         f"⏰ Commande en attente. Veuillez patienter {remaining} secondes."
@@ -131,7 +136,7 @@ class RunAwayButton(discord.ui.Button):
     async def callback(self, interaction: discord.Interaction):
         # Only allow the original user to use the button
         if interaction.user.id != self.ctx.author.id:
-            await interaction.response.send_message(_tr(self.ml,
+            await safe_response_send(interaction.response, _tr(self.ml,
                 "You cannot use this button.",
                 "لا يمكنك استخدام هذا الزر.",
                 "Vous ne pouvez pas utiliser ce bouton."
@@ -139,7 +144,7 @@ class RunAwayButton(discord.ui.Button):
             return
    
         # First acknowledge the interaction to prevent timeout
-        await interaction.response.defer()
+        await safe_defer(interaction.response)
    
         # Set a flag on the dungeon_commands to indicate this dungeon has been fled
         self.dungeon_commands.fled_dungeons.add(self.ctx.author.id)
@@ -147,12 +152,12 @@ class RunAwayButton(discord.ui.Button):
         # Disable the button to prevent multiple clicks
         self.disabled = True
         try:
-            await interaction.message.edit(view=self.view)
+            await safe_edit(interaction.message, view=self.view)
         except:
             pass
    
         # Send a new message about fleeing
-        await self.ctx.send(_tr(self.ml,
+        await safe_send(self.ctx, _tr(self.ml,
             "🏃‍♂️ **You have fled from the dungeon!**",
             "🏃‍♂️ **لقد هربت من الزنزانة!**",
             "🏃‍♂️ **Vous avez fui le donjon !**"
@@ -160,14 +165,14 @@ class RunAwayButton(discord.ui.Button):
    
         # Handle the run away logic
         await self.dungeon_commands.handle_run_away(self.ctx, interaction.message)
-        self.dungeon_commands.dungeons_in_progress.remove(self.ctx.author.id)
+        self.dungeon_commands.dungeons_in_progress.discard(self.ctx.author.id)
         # Delete the original dungeon message completely
         try:
             await interaction.message.delete()
         except:
             # If we can't delete, try to at least remove all content
             try:
-                await interaction.message.edit(content="", embed=None, view=None, attachments=[])
+                await safe_edit(interaction.message, content="", embed=None, view=None, attachments=[])
             except:
                 pass
 
@@ -190,6 +195,57 @@ class DungeonCommands(commands.Cog):
         self.dungeons_in_progress = set()  # Track active dungeons
         self.fled_dungeons = set()  # Track dungeons that have been fled
         self.image_path = os.path.join(os.path.dirname(__file__), '..', 'images')
+
+    async def reset_dungeon_state(self, ctx, user_id=None, *, clear_timer: bool = False):
+        """Release dungeon activity flags for the current command without touching rewards."""
+        self.dungeons_in_progress.discard(ctx.author.id)
+        self.fled_dungeons.discard(ctx.author.id)
+
+        if user_id is None:
+            user_id = await self.get_user_id(ctx.author.id)
+
+        if user_id:
+            await release_user_activity(user_id, "dungeon_current")
+            if clear_timer:
+                await execute_query_with_retry(
+                    "UPDATE user SET dungeon_timer = NULL WHERE user_id = %s",
+                    (user_id,),
+                )
+
+    async def consume_dungeon_entry(self, user_id, inventory_id, dungeonkey_id, current_time):
+        """Atomically consume the entry key and start cooldown after the battle message exists."""
+        async with db_transaction():
+            key_rows = await execute_query_with_retry(
+                """
+                SELECT quantiter
+                FROM inventory_dungeonkey
+                WHERE inventory_id = %s AND dungeonkey_id = %s
+                FOR UPDATE
+                """,
+                (inventory_id, dungeonkey_id),
+            )
+            if not key_rows or key_rows[0]["quantiter"] <= 0:
+                return False
+
+            await execute_query_with_retry(
+                "UPDATE user SET dungeon_timer = %s WHERE user_id = %s",
+                (current_time, user_id),
+            )
+            if key_rows[0]["quantiter"] == 1:
+                await execute_query_with_retry(
+                    "DELETE FROM inventory_dungeonkey WHERE inventory_id = %s AND dungeonkey_id = %s",
+                    (inventory_id, dungeonkey_id),
+                )
+            else:
+                await execute_query_with_retry(
+                    """
+                    UPDATE inventory_dungeonkey
+                    SET quantiter = quantiter - 1
+                    WHERE inventory_id = %s AND dungeonkey_id = %s
+                    """,
+                    (inventory_id, dungeonkey_id),
+                )
+            return True
 
     def calculate_dodge_chance(self, attacker_speed, defender_speed):
         """
@@ -532,6 +588,7 @@ class DungeonCommands(commands.Cog):
 # In DungeonCommands class, inside the dungeon command method
 
     @commands.command(name="dungeon", aliases=["dg", "dgn"])
+    @advisory_lock_for_context("dungeon_start", timeout=2)
     async def dungeon(self, ctx, rank: str = None):
         print("passed through")
         multilanguage = await get_user_multilanguage(ctx.author.id)
@@ -546,14 +603,14 @@ class DungeonCommands(commands.Cog):
                         selected_rank_enum = dr
                         break
                 if not selected_rank_enum:
-                    await ctx.send(_tr(multilanguage,
+                    await safe_send(ctx, _tr(multilanguage,
                         f"❌ Invalid dungeon rank: {rank}. Valid ranks are: E, D, C, B, A, S",
                         f"❌ رتبة زنزانة غير صالحة: {rank}. الرتب الصالحة هي: E, D, C, B, A, S",
                         f"❌ Rang de donjon invalide : {rank}. Rangs valides : E, D, C, B, A, S"
                     ))
                     return
             else:
-                await ctx.send(_tr(multilanguage,
+                await safe_send(ctx, _tr(multilanguage,
                     f"❌ Invalid dungeon rank: {rank}. Valid ranks are: E, D, C, B, A, S",
                     f"❌ رتبة زنزانة غير صالحة: {rank}. الرتب الصالحة هي: E, D, C, B, A, S",
                     f"❌ Rang de donjon invalide : {rank}. Rangs valides : E, D, C, B, A, S"
@@ -562,16 +619,20 @@ class DungeonCommands(commands.Cog):
 
         user_id = await self.get_user_id(ctx.author.id)
         if not user_id:
-            await ctx.send(_tr(multilanguage,
+            await safe_send(ctx, _tr(multilanguage,
                 "You need to be registered to use this command.",
                 "يجب أن تكون مسجلاً لاستخدام هذا الأمر.",
                 "Vous devez être inscrit pour utiliser cette commande."
             ))
             return
 
+        stale_dungeon_released = await cleanup_stale_user_activity(user_id, "dungeon_current", "dungeon_timer", 1800)
+        if stale_dungeon_released:
+            self.dungeons_in_progress.discard(ctx.author.id)
+
         # First check if user is in the in-memory tracking
         if ctx.author.id in self.dungeons_in_progress:
-            await ctx.send(_tr(multilanguage,
+            await safe_send(ctx, _tr(multilanguage,
                 "Please finish your current dungeon exploration before starting a new one.",
                 "يرجى إنهاء استكشافك الحالي للزنزانة قبل بدء واحد جديد.",
                 "Veuillez terminer votre exploration actuelle du donjon avant d'en commencer une nouvelle."
@@ -583,18 +644,14 @@ class DungeonCommands(commands.Cog):
         dungeon_status_result = await execute_query_with_retry(check_dungeon_status_query, (user_id,))
 
         if dungeon_status_result[0]['dungeon_current'] == 1:
-            # User is marked as in a dungeon in the database but not in memory
-            # This is a stale state - reset it and inform the user
-            update_dungeon_current_query = "UPDATE user SET dungeon_current = 0 WHERE user_id = %s"
-            await execute_query_with_retry(update_dungeon_current_query, (user_id,))
-            logging.info(f"Fixed stale dungeon state for user {ctx.author.id}")
-            await ctx.send(_tr(multilanguage,
-                "Your previous dungeon state was reset. You can now enter a new dungeon.",
-                "تمت إعادة ضبط حالة الزنزانة السابقة. يمكنك الآن دخول زنزانة جديدة.",
-                "L'état précédent du donjon a été réinitialisé. Vous pouvez entrer dans un nouveau donjon."
+            await safe_send(ctx, _tr(multilanguage,
+                "Please finish your current dungeon exploration before starting a new one.",
+                "يرجى إنهاء استكشافك الحالي للزنزانة قبل بدء واحد جديد.",
+                "Veuillez terminer votre exploration actuelle du donjon avant d'en commencer une nouvelle."
             ))
+            return
 
-        # Add user to in-progress set AFTER checking for stale state
+        # Add user to in-progress set after the database says the activity is free.
         self.dungeons_in_progress.add(ctx.author.id)
 
         # Check cooldown
@@ -612,30 +669,26 @@ class DungeonCommands(commands.Cog):
                 remaining_secs = int(remaining_seconds % 60)
 
                 # Remove from in-progress before returning
-                self.dungeons_in_progress.remove(ctx.author.id)
+                self.dungeons_in_progress.discard(ctx.author.id)
 
                 if remaining_minutes > 0:
-                    await ctx.send(_tr(multilanguage,
+                    await safe_send(ctx, _tr(multilanguage,
                         f"⏳ You must wait {remaining_minutes}m {remaining_secs}s before entering another dungeon!",
                         f"⏳ يجب عليك الانتظار {remaining_minutes}د {remaining_secs}ث قبل دخول زنزانة أخرى!",
                         f"⏳ Vous devez attendre {remaining_minutes}m {remaining_secs}s avant d'entrer dans un autre donjon !"
                     ))
                 else:
-                    await ctx.send(_tr(multilanguage,
+                    await safe_send(ctx, _tr(multilanguage,
                         f"⏳ You must wait {remaining_secs}s before entering another dungeon!",
                         f"⏳ يجب عليك الانتظار {remaining_secs}ث قبل دخول زنزانة أخرى!",
                         f"⏳ Vous devez attendre {remaining_secs}s avant d'entrer dans un autre donjon !"
                     ))
                 return
 
-        # Double-check dungeon status again before proceeding
-        check_dungeon_status_query = "SELECT dungeon_current FROM user WHERE user_id = %s"
-        dungeon_status_result = await execute_query_with_retry(check_dungeon_status_query, (user_id,))
-
-        if dungeon_status_result[0]['dungeon_current'] == 1:
-            # Remove from in-progress before returning
-            self.dungeons_in_progress.remove(ctx.author.id)
-            await ctx.send(_tr(multilanguage,
+        dungeon_claimed = await claim_user_activity(user_id, "dungeon_current")
+        if not dungeon_claimed:
+            self.dungeons_in_progress.discard(ctx.author.id)
+            await safe_send(ctx, _tr(multilanguage,
                 "Please finish your current dungeon exploration before starting a new one.",
                 "يرجى إنهاء استكشافك الحالي للزنزانة قبل بدء واحد جديد.",
                 "Veuillez terminer votre exploration actuelle du donjon avant d'en commencer une nouvelle."
@@ -669,8 +722,9 @@ class DungeonCommands(commands.Cog):
 
         if not inventory_id or not team_id:
             # Remove from in-progress before returning
-            self.dungeons_in_progress.remove(ctx.author.id)
-            await ctx.send(_tr(multilanguage,
+            self.dungeons_in_progress.discard(ctx.author.id)
+            await release_user_activity(user_id, "dungeon_current")
+            await safe_send(ctx, _tr(multilanguage,
                 "You need to have an inventory and a team to enter a dungeon.",
                 "تحتاج إلى امتلاك مخزون وفريق لدخول زنزانة.",
                 "Vous devez avoir un inventaire et une équipe pour entrer dans un donjon."
@@ -679,8 +733,9 @@ class DungeonCommands(commands.Cog):
 
         all_dungeons_from_db = await self.get_solo_dungeons()
         if not all_dungeons_from_db:
-            self.dungeons_in_progress.remove(ctx.author.id)
-            await ctx.send(_tr(multilanguage,
+            self.dungeons_in_progress.discard(ctx.author.id)
+            await release_user_activity(user_id, "dungeon_current")
+            await safe_send(ctx, _tr(multilanguage,
                 "No dungeons available at the moment.",
                 "لا توجد زنزانات متاحة حاليًا.",
                 "Aucun donjon disponible pour le moment."
@@ -700,8 +755,9 @@ class DungeonCommands(commands.Cog):
 
         dungeons_to_display = ordered_dungeons
         if not dungeons_to_display:
-            self.dungeons_in_progress.remove(ctx.author.id)
-            await ctx.send(_tr(multilanguage,
+            self.dungeons_in_progress.discard(ctx.author.id)
+            await release_user_activity(user_id, "dungeon_current")
+            await safe_send(ctx, _tr(multilanguage,
                 "No dungeons available after ordering. Please check dungeon configurations.",
                 "لا توجد زنزانات متاحة بعد الترتيب. يرجى التحقق من إعدادات الزنزانات.",
                 "Aucun donjon disponible après tri. Veuillez vérifier la configuration des donjons."
@@ -717,8 +773,9 @@ class DungeonCommands(commands.Cog):
                     break
 
             if not selected_dungeon:
-                self.dungeons_in_progress.remove(ctx.author.id)
-                await ctx.send(_tr(multilanguage,
+                self.dungeons_in_progress.discard(ctx.author.id)
+                await release_user_activity(user_id, "dungeon_current")
+                await safe_send(ctx, _tr(multilanguage,
                     f"❌ {selected_rank_enum.value[0]} dungeon is not available.",
                     f"❌ زنزانة {selected_rank_enum.value[0]} غير متاحة.",
                     f"❌ Le donjon {selected_rank_enum.value[0]} n'est pas disponible."
@@ -726,8 +783,17 @@ class DungeonCommands(commands.Cog):
                 return
 
             # Directly enter the dungeon (same logic as clicking 🚪)
-            await self.enter_dungeon(ctx, selected_dungeon, selected_rank_enum, user_id, inventory_id, team_id,
-                                     dungeon_cards_query, user_cards_query, multilanguage, current_time)
+            try:
+                await self.enter_dungeon(ctx, selected_dungeon, selected_rank_enum, user_id, inventory_id, team_id,
+                                         dungeon_cards_query, user_cards_query, multilanguage, current_time)
+            except Exception as error:
+                await self.reset_dungeon_state(ctx, user_id)
+                logging.error(f"Error entering selected dungeon: {error}")
+                await safe_send(ctx, _tr(multilanguage,
+                    "An unexpected error occurred while entering the dungeon. Please try again later.",
+                    "حدث خطأ غير متوقع أثناء دخول الزنزانة. يرجى المحاولة لاحقًا.",
+                    "Une erreur inattendue s’est produite lors de l’entrée dans le donjon. Veuillez réessayer plus tard."
+                ))
             return
 
         current_page = 0
@@ -777,7 +843,7 @@ class DungeonCommands(commands.Cog):
             @discord.ui.button(label="<", style=discord.ButtonStyle.secondary)
             async def previous_button(self, interaction: discord.Interaction, button: discord.ui.Button):
                 if interaction.user.id != ctx.author.id:
-                    await interaction.response.send_message(_tr(multilanguage,
+                    await safe_response_send(interaction.response, _tr(multilanguage,
                         "This is not your dungeon selection!",
                         "هذا ليس اختيار الزنزانة الخاص بك!",
                         "Ce n'est pas votre sélection de donjon !"
@@ -786,12 +852,12 @@ class DungeonCommands(commands.Cog):
 
                 nonlocal current_page
                 current_page = (current_page - 1) % len(dungeons_to_display)
-                await interaction.response.edit_message(embed=await update_embed(), view=self)
+                await safe_response_edit(interaction.response, embed=await update_embed(), view=self)
 
             @discord.ui.button(label=">", style=discord.ButtonStyle.secondary)
             async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
                 if interaction.user.id != ctx.author.id:
-                    await interaction.response.send_message(_tr(multilanguage,
+                    await safe_response_send(interaction.response, _tr(multilanguage,
                         "This is not your dungeon selection!",
                         "هذا ليس اختيار الزنزانة الخاص بك!",
                         "Ce n'est pas votre sélection de donjon !"
@@ -800,12 +866,12 @@ class DungeonCommands(commands.Cog):
 
                 nonlocal current_page
                 current_page = (current_page + 1) % len(dungeons_to_display)
-                await interaction.response.edit_message(embed=await update_embed(), view=self)
+                await safe_response_edit(interaction.response, embed=await update_embed(), view=self)
 
             @discord.ui.button(label="🚪 Enter", style=discord.ButtonStyle.primary)
             async def enter_button(self, interaction: discord.Interaction, button: discord.ui.Button):
                 if interaction.user.id != ctx.author.id:
-                    await interaction.response.send_message(_tr(multilanguage,
+                    await safe_response_send(interaction.response, _tr(multilanguage,
                         "This is not your dungeon selection!",
                         "هذا ليس اختيار الزنزانة الخاص بك!",
                         "Ce n'est pas votre sélection de donjon !"
@@ -814,19 +880,24 @@ class DungeonCommands(commands.Cog):
 
                 self.value = "enter"
                 self.stop()
-                await interaction.response.defer()
+                await safe_defer(interaction.response)
 
         view = DungeonView(timeout=60)
-        message = await ctx.send(embed=await update_embed(), view=view)
+        ok, message = await safe_send(ctx, embed=await update_embed(), view=view)
+        if not ok or message is None:
+            self.dungeons_in_progress.discard(ctx.author.id)
+            update_dungeon_current_query = "UPDATE user SET dungeon_current = 0 WHERE user_id = %s"
+            await execute_query_with_retry(update_dungeon_current_query, (user_id,))
+            return
 
         await view.wait()
 
         if view.value != "enter":
             # Timeout occurred
-            self.dungeons_in_progress.remove(ctx.author.id)
+            self.dungeons_in_progress.discard(ctx.author.id)
             update_dungeon_current_query = "UPDATE user SET dungeon_current = 0 WHERE user_id = %s"
             await execute_query_with_retry(update_dungeon_current_query, (user_id,))
-            await ctx.send(_tr(multilanguage,
+            await safe_send(ctx, _tr(multilanguage,
                 "The gates have sealed shut. Your hesitation has cost you this opportunity, hunter.",
                 "انغلقت البوابات. ترددك كلفك هذه الفرصة أيها الصياد.",
                 "Les portes se sont refermées. Votre hésitation vous a coûté cette opportunité, chasseur."
@@ -843,37 +914,31 @@ class DungeonCommands(commands.Cog):
                 selected_rank_enum = dr
                 break
         if not selected_rank_enum:
-            await ctx.send(_tr(multilanguage,
+            await safe_send(ctx, _tr(multilanguage,
                 "Error: Could not find matching dungeon rank. Please contact an administrator.",
                 "خطأ: تعذر العثور على رتبة زنزانة مطابقة. يرجى التواصل مع المسؤول.",
                 "Erreur : Impossible de trouver le rang de donjon correspondant. Veuillez contacter un administrateur."
             ))
             update_dungeon_current_query = "UPDATE user SET dungeon_current = 0 WHERE user_id = %s"
             await execute_query_with_retry(update_dungeon_current_query, (user_id,))
-            self.dungeons_in_progress.remove(ctx.author.id)
+            self.dungeons_in_progress.discard(ctx.author.id)
             return
 
-        await self.enter_dungeon(ctx, selected_dungeon, selected_rank_enum, user_id, inventory_id, team_id,
-                                 dungeon_cards_query, user_cards_query, multilanguage, current_time)
+        try:
+            await self.enter_dungeon(ctx, selected_dungeon, selected_rank_enum, user_id, inventory_id, team_id,
+                                     dungeon_cards_query, user_cards_query, multilanguage, current_time)
+        except Exception as error:
+            await self.reset_dungeon_state(ctx, user_id)
+            logging.error(f"Error entering selected dungeon: {error}")
+            await safe_send(ctx, _tr(multilanguage,
+                "An unexpected error occurred while entering the dungeon. Please try again later.",
+                "حدث خطأ غير متوقع أثناء دخول الزنزانة. يرجى المحاولة لاحقًا.",
+                "Une erreur inattendue s’est produite lors de l’entrée dans le donjon. Veuillez réessayer plus tard."
+            ))
 
     async def enter_dungeon(self, ctx, selected_dungeon, selected_rank_enum, user_id, inventory_id, team_id,
                            dungeon_cards_query, user_cards_query, multilanguage, current_time):
         """Handle the actual dungeon entry logic after selection"""
-
-        check_dungeon_status_query = "SELECT dungeon_current FROM user WHERE user_id = %s"
-        dungeon_status_result = await execute_query_with_retry(check_dungeon_status_query, (user_id,))
-
-        if dungeon_status_result[0]['dungeon_current'] == 1:
-            self.dungeons_in_progress.remove(ctx.author.id)
-            await ctx.send(_tr(multilanguage,
-                "Please finish your current dungeon exploration before starting a new one.",
-                "يرجى إنهاء استكشافك الحالي للزنزانة قبل بدء واحد جديد.",
-                "Veuillez terminer votre exploration actuelle du donjon avant d'en commencer une nouvelle."
-            ))
-            return
-
-        update_dungeon_current_query = "UPDATE user SET dungeon_current = 1 WHERE user_id = %s"
-        await execute_query_with_retry(update_dungeon_current_query, (user_id,))
 
         # Check for dungeon key
         key_query = """
@@ -883,17 +948,16 @@ class DungeonCommands(commands.Cog):
         WHERE idk.inventory_id = %s AND d.dungeon_id = %s
         """
         key_result = await execute_query_with_retry(key_query, (inventory_id, selected_dungeon['dungeon_id']))
-        if not key_result:
+        if not key_result or key_result[0]['quantiter'] <= 0:
             update_dungeon_current_query = "UPDATE user SET dungeon_current = 0 WHERE user_id = %s"
             await execute_query_with_retry(update_dungeon_current_query, (user_id,))
-            self.dungeons_in_progress.remove(ctx.author.id)
-            await ctx.send(_tr(multilanguage,
+            self.dungeons_in_progress.discard(ctx.author.id)
+            await safe_send(ctx, _tr(multilanguage,
                 "You don't have the required key for this dungeon.",
                 "ليس لديك المفتاح المطلوب لهذه الزنزانة.",
                 "Vous n'avez pas la clé requise pour ce donjon."
             ))
             return
-        key_quantity = key_result[0]['quantiter']
 
         # Check for fighter card
         fighter_query = """
@@ -908,24 +972,13 @@ class DungeonCommands(commands.Cog):
         if fighter_result[0]['fighter_count'] == 0:
             update_dungeon_current_query = "UPDATE user SET dungeon_current = 0 WHERE user_id = %s"
             await execute_query_with_retry(update_dungeon_current_query, (user_id,))
-            self.dungeons_in_progress.remove(ctx.author.id)
-            await ctx.send(_tr(multilanguage,
+            self.dungeons_in_progress.discard(ctx.author.id)
+            await safe_send(ctx, _tr(multilanguage,
                 "Your team needs at least one Fighter card to enter the dungeon.",
                 "يجب أن يحتوي فريقك على بطاقة مقاتل واحدة على الأقل لدخول الزنزانة.",
                 "Votre équipe a besoin d'au moins une carte Combattant pour entrer dans un donjon."
             ))
             return
-
-        update_timer_query = "UPDATE user SET dungeon_timer = %s WHERE user_id = %s"
-        await execute_query_with_retry(update_timer_query, (current_time, user_id))
-
-        # Update or delete the dungeon key
-        if key_quantity == 1:
-            delete_key_query = "DELETE FROM inventory_dungeonkey WHERE inventory_id = %s AND dungeonkey_id = %s"
-            await execute_query_with_retry(delete_key_query, (inventory_id, selected_dungeon['dungeonkey_id']))
-        else:
-            update_key_query = "UPDATE inventory_dungeonkey SET quantiter = quantiter - 1 WHERE inventory_id = %s AND dungeonkey_id = %s"
-            await execute_query_with_retry(update_key_query, (inventory_id, selected_dungeon['dungeonkey_id']))
 
         # Get dungeon cards
         dungeon_cards = await execute_query_with_retry(dungeon_cards_query, (selected_dungeon['dungeon_id'],))
@@ -933,8 +986,8 @@ class DungeonCommands(commands.Cog):
         if not dungeon_cards:
             update_dungeon_current_query = "UPDATE user SET dungeon_current = 0 WHERE user_id = %s"
             await execute_query_with_retry(update_dungeon_current_query, (user_id,))
-            self.dungeons_in_progress.remove(ctx.author.id)
-            await ctx.send(_tr(multilanguage,
+            self.dungeons_in_progress.discard(ctx.author.id)
+            await safe_send(ctx, _tr(multilanguage,
                 f"🚫 This dungeon ({selected_dungeon['dungeon_name']}) has no monsters configured! Please contact an administrator or ensure the `dungeon_cards` table is populated for this dungeon.",
                 f"🚫 هذه الزنزانة ({selected_dungeon['dungeon_name']}) لا تحتوي على وحوش مُعدّة! يرجى التواصل مع المسؤول أو التأكد من تعبئة جدول `dungeon_cards` لهذه الزنزانة.",
                 f"🚫 Ce donjon ({selected_dungeon['dungeon_name']}) n'a pas de monstres configurés ! Contactez un administrateur ou remplissez la table `dungeon_cards` pour ce donjon."
@@ -947,8 +1000,8 @@ class DungeonCommands(commands.Cog):
         if not user_fighter_cards:
             update_dungeon_current_query = "UPDATE user SET dungeon_current = 0 WHERE user_id = %s"
             await execute_query_with_retry(update_dungeon_current_query, (user_id,))
-            self.dungeons_in_progress.remove(ctx.author.id)
-            await ctx.send(_tr(multilanguage,
+            self.dungeons_in_progress.discard(ctx.author.id)
+            await safe_send(ctx, _tr(multilanguage,
                 "🚫 You need at least one 'Fighter' card in your team to enter a dungeon. Please add one to your team.",
                 "🚫 تحتاج إلى بطاقة «مقاتل» واحدة على الأقل في فريقك لدخول الزنزانة. يرجى إضافة واحدة إلى فريقك.",
                 "🚫 Vous avez besoin d'au moins une carte « Combattant » dans votre équipe pour entrer dans un donjon. Veuillez en ajouter une."
@@ -958,7 +1011,18 @@ class DungeonCommands(commands.Cog):
         # Apply charm effects
         user_fighter_cards = await self.apply_charm_effects(user_id, user_fighter_cards)
         # Start the dungeon
-        await self.start_dungeon(ctx, selected_rank_enum, user_fighter_cards, dungeon_cards, selected_dungeon, multilanguage)
+        await self.start_dungeon(
+            ctx,
+            selected_rank_enum,
+            user_fighter_cards,
+            dungeon_cards,
+            selected_dungeon,
+            multilanguage,
+            user_id=user_id,
+            inventory_id=inventory_id,
+            current_time=current_time,
+            dungeonkey_id=selected_dungeon['dungeonkey_id'],
+        )
     def format_dungeon_description(self, difficulty: DungeonRank, multilanguage: int = 0) -> str:
         if multilanguage == 1:
             descriptions = {
@@ -1077,7 +1141,7 @@ class DungeonCommands(commands.Cog):
             embed.add_field(name=field_name, value=field_value, inline=field_inline)
            
             # Update the message
-            await dungeon_message.edit(embed=embed)
+            await safe_edit(dungeon_message, embed=embed)
         except Exception as e:
             logging.error(f"Error updating embed fields: {str(e)}")
             raise
@@ -1153,7 +1217,20 @@ class DungeonCommands(commands.Cog):
         }
         return power_suggestions[rank_enum]
 
-    async def start_dungeon(self, ctx, rank_enum: DungeonRank, user_fighter_cards, dungeon_cards, dungeon_data, multilanguage: int = 0):
+    async def start_dungeon(
+        self,
+        ctx,
+        rank_enum: DungeonRank,
+        user_fighter_cards,
+        dungeon_cards,
+        dungeon_data,
+        multilanguage: int = 0,
+        *,
+        user_id=None,
+        inventory_id=None,
+        current_time=None,
+        dungeonkey_id=None,
+    ):
         # Extract card IDs for the fighters that will participate in the dungeon
         user_card_ids = [card['card_id'] for card in user_fighter_cards]
 
@@ -1196,7 +1273,25 @@ class DungeonCommands(commands.Cog):
         ))
 
         # Send the initial dungeon message without the Run Away button
-        dungeon_message = await ctx.send(embed=embed)
+        ok, dungeon_message = await safe_send(ctx, embed=embed)
+        if not ok or dungeon_message is None:
+            await self.reset_dungeon_state(ctx, user_id)
+            return
+
+        entry_consumed = await self.consume_dungeon_entry(user_id, inventory_id, dungeonkey_id, current_time)
+        if not entry_consumed:
+            await self.reset_dungeon_state(ctx, user_id)
+            error_embed = discord.Embed(
+                title=_tr(multilanguage, "❌ Dungeon Entry Failed", "❌ فشل دخول الزنزانة", "❌ Entrée du donjon échouée"),
+                description=_tr(multilanguage,
+                    "You no longer have the required key for this dungeon.",
+                    "لم يعد لديك المفتاح المطلوب لهذه الزنزانة.",
+                    "Vous n’avez plus la clé requise pour ce donjon."
+                ),
+                color=discord.Color.red()
+            )
+            await safe_edit(dungeon_message, embed=error_embed, view=None, attachments=[])
+            return
         await asyncio.sleep(3)
 
         # Go!
@@ -1318,9 +1413,11 @@ class DungeonCommands(commands.Cog):
             ))
 
             try:
-                dungeon_message = await dungeon_message.edit(embed=embed, view=view)
+                await safe_edit(dungeon_message, embed=embed, view=view)
             except discord.errors.NotFound:
-                dungeon_message = await ctx.send(embed=embed, view=view)
+                ok, new_dungeon_message = await safe_send(ctx, embed=embed, view=view)
+                if ok and new_dungeon_message is not None:
+                    dungeon_message = new_dungeon_message
 
             evasion_pass_used = False
             rounds_to_play = sorted(list(dungeon_rounds.keys()))
@@ -1331,7 +1428,7 @@ class DungeonCommands(commands.Cog):
 
                 if ctx.author.id in self.fled_dungeons:
                     logging.info(f"User {ctx.author.id} has fled the dungeon, stopping exploration")
-                    self.fled_dungeons.remove(ctx.author.id)
+                    self.fled_dungeons.discard(ctx.author.id)
                     return
 
                 # Reset user team health each round
@@ -1372,7 +1469,7 @@ class DungeonCommands(commands.Cog):
                 embed.add_field(name=_tr(multilanguage, "⚔️ Round", "⚔️ الجولة", "⚔️ Manche") + f" {current_round}",
                                 value=round_description, inline=False)
                 try:
-                    await dungeon_message.edit(embed=embed)
+                    await safe_edit(dungeon_message, embed=embed)
                 except discord.errors.NotFound:
                     return
 
@@ -1383,7 +1480,7 @@ class DungeonCommands(commands.Cog):
                 while round_monsters and user_team:
                     if ctx.author.id in self.fled_dungeons:
                         logging.info(f"User {ctx.author.id} has fled the dungeon, stopping exploration")
-                        self.fled_dungeons.remove(ctx.author.id)
+                        self.fled_dungeons.discard(ctx.author.id)
                         return
 
                     current_fight_complete = False
@@ -1428,18 +1525,18 @@ class DungeonCommands(commands.Cog):
                                 card_file = discord.File(card_image_path, filename=card_filename)
                                 files.append(card_file)
                                 embed.set_image(url=f"attachment://{card_filename}")
-                                await dungeon_message.edit(embed=embed, attachments=files)
+                                await safe_edit(dungeon_message, embed=embed, attachments=files)
                             except discord.errors.NotFound:
                                 return
                             except Exception as e:
                                 logging.error(f"Error loading card image: {e}")
                                 try:
-                                    await dungeon_message.edit(embed=embed)
+                                    await safe_edit(dungeon_message, embed=embed)
                                 except discord.errors.NotFound:
                                     return
                         else:
                             try:
-                                await dungeon_message.edit(embed=embed)
+                                await safe_edit(dungeon_message, embed=embed, min_interval=1.0)
                             except discord.errors.NotFound:
                                 return
                     except discord.errors.NotFound:
@@ -1451,7 +1548,7 @@ class DungeonCommands(commands.Cog):
                     while (not current_fight_complete) and monster['current_health'] > 0 and user_card['current_health'] > 0:
                         if ctx.author.id in self.fled_dungeons:
                             logging.info(f"User {ctx.author.id} has fled the dungeon, stopping exploration")
-                            self.fled_dungeons.remove(ctx.author.id)
+                            self.fled_dungeons.discard(ctx.author.id)
                             return
 
                         await asyncio.sleep(0.7)
@@ -1465,7 +1562,7 @@ class DungeonCommands(commands.Cog):
                             round_log.extend(user_effect_messages)
                             try:
                                 await self.update_embed_with_health_bars(embed, dungeon_message, round_log, current_round, user_card, monster, multilanguage)
-                                await dungeon_message.edit(embed=embed)
+                                await safe_edit(dungeon_message, embed=embed)
                             except discord.errors.NotFound:
                                 return
                             await asyncio.sleep(0)
@@ -1537,7 +1634,7 @@ class DungeonCommands(commands.Cog):
 
                         try:
                             await self.update_embed_with_health_bars(embed, dungeon_message, round_log, current_round, user_card, monster, multilanguage)
-                            await dungeon_message.edit(embed=embed)
+                            await safe_edit(dungeon_message, embed=embed, min_interval=1.0)
                         except discord.errors.NotFound:
                             return
 
@@ -1560,7 +1657,7 @@ class DungeonCommands(commands.Cog):
                                 round_log.extend(boss_turn_messages)
                                 try:
                                     await self.update_embed_with_health_bars(embed, dungeon_message, round_log, current_round, user_card, monster, multilanguage)
-                                    await dungeon_message.edit(embed=embed)
+                                    await safe_edit(dungeon_message, embed=embed, min_interval=1.0)
                                 except discord.errors.NotFound:
                                     return
                                 await asyncio.sleep(1)
@@ -1616,7 +1713,7 @@ class DungeonCommands(commands.Cog):
 
                             try:
                                 await self.update_embed_with_health_bars(embed, dungeon_message, round_log, current_round, user_card, monster, multilanguage)
-                                await dungeon_message.edit(embed=embed)
+                                await safe_edit(dungeon_message, embed=embed, min_interval=1.0)
                             except discord.errors.NotFound:
                                 return
 
@@ -1632,7 +1729,7 @@ class DungeonCommands(commands.Cog):
                 if not round_monsters and current_round < total_rounds:
                     if ctx.author.id in self.fled_dungeons:
                         logging.info(f"User {ctx.author.id} has fled the dungeon, stopping exploration")
-                        self.fled_dungeons.remove(ctx.author.id)
+                        self.fled_dungeons.discard(ctx.author.id)
                         return
 
                     if current_round == 1 and not evasion_pass_used:
@@ -1651,7 +1748,7 @@ class DungeonCommands(commands.Cog):
                                 inline=False
                             )
                             try:
-                                await dungeon_message.edit(embed=embed, attachments=[])
+                                await safe_edit(dungeon_message, embed=embed, attachments=[])
                             except discord.errors.NotFound:
                                 return
                             await asyncio.sleep(2)
@@ -1668,7 +1765,7 @@ class DungeonCommands(commands.Cog):
                     )
                     embed.set_image(url=difficulty.value[2])
                     try:
-                        await dungeon_message.edit(embed=embed, attachments=[])
+                        await safe_edit(dungeon_message, embed=embed, attachments=[])
                     except discord.errors.NotFound:
                         return
                     await asyncio.sleep(2)
@@ -1680,7 +1777,7 @@ class DungeonCommands(commands.Cog):
                         if hasattr(dungeon_message, 'view') and dungeon_message.view:
                             for item in dungeon_message.view.children:
                                 item.disabled = True
-                            await dungeon_message.edit(view=dungeon_message.view)
+                            await safe_edit(dungeon_message, view=dungeon_message.view)
                     except Exception as e:
                         logging.error(f"Error disabling Run Away button: {str(e)}")
 
@@ -1693,29 +1790,21 @@ class DungeonCommands(commands.Cog):
                         if hasattr(dungeon_message, 'view') and dungeon_message.view:
                             for item in dungeon_message.view.children:
                                 item.disabled = True
-                            await dungeon_message.edit(view=dungeon_message.view)
+                            await safe_edit(dungeon_message, view=dungeon_message.view)
                     except Exception as e:
                         logging.error(f"Error disabling Run Away button: {str(e)}")
 
                     await self.handle_dungeon_defeat(ctx, dungeon_message, embed, difficulty, multilanguage)
                     try:
-                        await dungeon_message.edit(embed=embed, attachments=[])
+                        await safe_edit(dungeon_message, embed=embed, attachments=[])
                     except discord.errors.NotFound:
                         pass
                     return
 
                 round_index += 1
 
-            # cleanup
-            if ctx.author.id in self.dungeons_in_progress:
-                self.dungeons_in_progress.remove(ctx.author.id)
-            if ctx.author.id in self.fled_dungeons:
-                self.fled_dungeons.remove(ctx.author.id)
             try:
-                user_id = await self.get_user_id(ctx.author.id)
-                if user_id:
-                    update_dungeon_current_query = "UPDATE user SET dungeon_current = 0 WHERE user_id = %s"
-                    await execute_query_with_retry(update_dungeon_current_query, (user_id,))
+                await self.reset_dungeon_state(ctx)
             except Exception as cleanup_error:
                 logging.error(f"Error during final cleanup: {str(cleanup_error)}")
 
@@ -1724,47 +1813,31 @@ class DungeonCommands(commands.Cog):
             logging.error(traceback.format_exc())
             try:
                 user_id = await self.get_user_id(ctx.author.id)
-                if user_id:
-                    await execute_query_with_retry("UPDATE user SET dungeon_current = 0 WHERE user_id = %s", (user_id,))
-                    await execute_query_with_retry("UPDATE user SET dungeon_timer = NULL WHERE user_id = %s", (user_id,))
+                await self.reset_dungeon_state(ctx, user_id, clear_timer=True)
             except Exception as reset_error:
                 logging.error(f"Failed to reset dungeon state: {str(reset_error)}")
-            if ctx.author.id in self.dungeons_in_progress:
-                self.dungeons_in_progress.remove(ctx.author.id)
-            if ctx.author.id in self.fled_dungeons:
-                self.fled_dungeons.remove(ctx.author.id)
 
-            error_message = (
-                f"🚨 <@818132161534230559> Error in Dungeon system!\n"
-                f"```\nError: {str(e)}\n"
-                f"Channel: {ctx.channel.name} ({ctx.channel.id})\n"
-                f"Server: {ctx.guild.name} ({ctx.guild.id})\n"
-                f"Command User: {ctx.author.name} ({ctx.author.id})\n"
-                f"User data: {json.dumps(user_fighter_cards, indent=2)}\n"
-                f"Opponent data: {json.dumps(dungeon_cards, indent=2)}```\n"
-                f"Traceback:\n```python\n{traceback.format_exc()}```"
-            )
             try:
-                support_channel = ctx.bot.get_channel(1291676421109973043)
-                if support_channel:
-                    if len(error_message) > 2000:
-                        parts = [error_message[i:i+1990] for i in range(0, len(error_message), 1990)]
-                        for i, part in enumerate(parts):
-                            if i == 0:
-                                await support_channel.send(part)
-                            else:
-                                await support_channel.send(f"```{part}```")
-                    else:
-                        await support_channel.send(error_message)
-                await ctx.send(_tr(multilanguage,
+                await send_support_error(
+                    ctx.bot,
+                    1291676421109973043,
+                    "Dungeon system",
+                    e,
+                    ctx=ctx,
+                    extra={
+                        "difficulty": difficulty.value[0] if difficulty else None,
+                        "user_cards": compact_card_rows(user_fighter_cards),
+                        "opponents": compact_opponent_rows(dungeon_cards),
+                    },
+                )
+                await safe_send(ctx, _tr(multilanguage,
                     "An unexpected error occurred. Our support team has been notified and will investigate the issue.",
                     "حدث خطأ غير متوقع. تم إخطار فريق الدعم لدينا وسيتحقق من المشكلة.",
                     "Une erreur inattendue s’est produite. Notre équipe de support a été informée et enquêtera."
                 ))
             except Exception as send_error:
                 print(f"Failed to send error to support channel: {str(send_error)}")
-                print(error_message)
-                await ctx.send(_tr(multilanguage,
+                await safe_send(ctx, _tr(multilanguage,
                     "An unexpected error occurred. Please try again later.",
                     "حدث خطأ غير متوقع. يرجى المحاولة لاحقًا.",
                     "Une erreur inattendue s’est produite. Veuillez réessayer plus tard."
@@ -1791,13 +1864,82 @@ class DungeonCommands(commands.Cog):
             logging.error(f"Error updating embed with health bars: {str(e)}")
             raise
 
+    async def process_dungeon_victory_rewards(self, ctx, user_id, inventory_id, difficulty, user_card_ids=None, multilanguage: int = 0):
+        """Commit all dungeon victory rewards together; Discord notifications are sent after commit."""
+        async with db_transaction():
+            state_rows = await execute_query_with_retry(
+                "SELECT dungeon_current FROM user WHERE user_id = %s FOR UPDATE",
+                (user_id,),
+            )
+            if not state_rows or state_rows[0].get("dungeon_current") != 1:
+                return None
+
+            quest_message = await self.check_and_update_quest(user_id, multilanguage)
+            reward_result = await self.treasure_room(
+                ctx,
+                inventory_id,
+                difficulty.value[9],
+                f"{difficulty.value[0].lower()} gate",
+                user_card_ids,
+                multilanguage,
+                in_transaction=True,
+            )
+            rare_weapon = await self.handle_rare_weapon_drop(
+                ctx,
+                difficulty.value[9],
+                user_id=user_id,
+                inventory_id=inventory_id,
+                notify=False,
+            )
+            await execute_query_with_retry(
+                "UPDATE user SET dungeon_current = 0 WHERE user_id = %s",
+                (user_id,),
+            )
+
+        return {
+            "quest_message": quest_message,
+            "reward_result": reward_result,
+            "rare_weapon": rare_weapon,
+        }
+
+    async def send_dungeon_reward_notifications(self, ctx, reward_payload, multilanguage: int = 0):
+        """Display committed dungeon rewards without mutating reward state."""
+        if not reward_payload:
+            return
+
+        quest_message = reward_payload.get("quest_message")
+        if quest_message:
+            await safe_send(ctx, quest_message)
+
+        reward_result = reward_payload.get("reward_result")
+        if reward_result and reward_result.get('guild_contribution'):
+            await safe_send(ctx, f"Your guild received a contribution of {reward_result['guild_contribution']} <:won:1304034228966658048>.")
+        if reward_result:
+            await self.send_rewards_embed(
+                ctx,
+                reward_result['xp_rewards'],
+                reward_result['total_xp_gained'],
+                reward_result['total_cards_leveled'],
+                reward_result['money_reward'],
+                reward_result['gamble_reward'],
+                reward_result['rewards'],
+                reward_result['orb_reward'],
+                multilanguage
+            )
+
+        rare_weapon = reward_payload.get("rare_weapon")
+        if rare_weapon:
+            embed = discord.Embed(
+                title="✨ Rare Weapon Drop!",
+                description=f"You obtained a rare weapon: **{rare_weapon['weapon_name']}** ({rare_weapon['weapon_rarity']})!",
+                color=0xFFD700
+            )
+            await safe_send(ctx, embed=embed)
+
 
     async def handle_dungeon_victory(self, ctx, dungeon_message, embed, difficulty, user_card_ids=None, multilanguage: int = 0):
         try:
             user_id = await self.get_user_id(ctx.author.id)
-            await execute_query_with_retry("UPDATE user SET dungeon_current = 0 WHERE user_id = %s", (user_id,))
-            if ctx.author.id in self.dungeons_in_progress:
-                self.dungeons_in_progress.remove(ctx.author.id)
 
             embed.clear_fields()
             embed.add_field(name=_tr(multilanguage, "🎉 Dungeon Cleared!", "🎉 تم إنهاء الزنزانة!", "🎉 Donjon nettoyé !"),
@@ -1809,34 +1951,37 @@ class DungeonCommands(commands.Cog):
             embed.set_image(url=difficulty.value[2])
 
             try:
-                await dungeon_message.edit(embed=embed, view=None, attachments=[])
+                await safe_edit(dungeon_message, embed=embed, view=None, attachments=[])
             except discord.errors.NotFound:
-                dungeon_message = await ctx.send(embed=embed)
+                ok, dungeon_message = await safe_send(ctx, embed=embed)
             except Exception as edit_error:
                 logging.error(f"Error editing dungeon message: {str(edit_error)}")
                 try:
-                    dungeon_message = await ctx.send(embed=embed)
+                    ok, dungeon_message = await safe_send(ctx, embed=embed)
                 except:
                     pass
 
             inventory_id = await self.get_inventory_id(user_id)
-            quest_message = await self.check_and_update_quest(user_id, multilanguage)
-            if quest_message:
-                await ctx.send(quest_message)
-
-            await self.treasure_room(ctx, inventory_id, difficulty.value[9], f"{difficulty.value[0].lower()} gate", user_card_ids, multilanguage)
-            await self.handle_rare_weapon_drop(ctx, difficulty.value[9])
+            reward_payload = await self.process_dungeon_victory_rewards(
+                ctx,
+                user_id,
+                inventory_id,
+                difficulty,
+                user_card_ids,
+                multilanguage
+            )
+            self.dungeons_in_progress.discard(ctx.author.id)
+            self.fled_dungeons.discard(ctx.author.id)
+            await self.send_dungeon_reward_notifications(ctx, reward_payload, multilanguage)
         except Exception as e:
             logging.error(f"Error handling dungeon rewards: {str(e)}")
             traceback.print_exc()
             try:
                 if user_id:
-                    await execute_query_with_retry("UPDATE user SET dungeon_current = 0 WHERE user_id = %s", (user_id,))
-                if ctx.author.id in self.dungeons_in_progress:
-                    self.dungeons_in_progress.remove(ctx.author.id)
+                    await self.reset_dungeon_state(ctx, user_id)
             except:
                 pass
-            await ctx.send(_tr(multilanguage,
+            await safe_send(ctx, _tr(multilanguage,
                 "There was an error processing your dungeon rewards. Please contact an administrator.",
                 "حدث خطأ أثناء معالجة مكافآت الزنزانة. يرجى التواصل مع المسؤول.",
                 "Une erreur est survenue lors du traitement de vos récompenses. Veuillez contacter un administrateur."
@@ -1846,9 +1991,7 @@ class DungeonCommands(commands.Cog):
     async def handle_dungeon_defeat(self, ctx, dungeon_message, embed, difficulty, multilanguage: int = 0):
         try:
             user_id = await self.get_user_id(ctx.author.id)
-            await execute_query_with_retry("UPDATE user SET dungeon_current = 0 WHERE user_id = %s", (user_id,))
-            if ctx.author.id in self.dungeons_in_progress:
-                self.dungeons_in_progress.remove(ctx.author.id)
+            await self.reset_dungeon_state(ctx, user_id)
 
             embed.clear_fields()
             embed.add_field(
@@ -1873,13 +2016,13 @@ class DungeonCommands(commands.Cog):
 
             embed.set_image(url=difficulty.value[2])
             try:
-                await dungeon_message.edit(embed=embed, view=None, attachments=[])
+                await safe_edit(dungeon_message, embed=embed, view=None, attachments=[])
             except discord.errors.NotFound:
-                await ctx.send(embed=embed)
+                await safe_send(ctx, embed=embed)
             except Exception as edit_error:
                 logging.error(f"Error editing dungeon message: {str(edit_error)}")
                 try:
-                    await ctx.send(embed=embed)
+                    await safe_send(ctx, embed=embed)
                 except:
                     pass
 
@@ -1888,12 +2031,10 @@ class DungeonCommands(commands.Cog):
             traceback.print_exc()
             try:
                 if user_id:
-                    await execute_query_with_retry("UPDATE user SET dungeon_current = 0 WHERE user_id = %s", (user_id,))
-                if ctx.author.id in self.dungeons_in_progress:
-                    self.dungeons_in_progress.remove(ctx.author.id)
+                    await self.reset_dungeon_state(ctx, user_id)
             except:
                 pass
-            await ctx.send(_tr(multilanguage,
+            await safe_send(ctx, _tr(multilanguage,
                 "There was an error processing your dungeon defeat. Please contact an administrator.",
                 "حدث خطأ أثناء معالجة هزيمتك في الزنزانة. يرجى التواصل مع المسؤول.",
                 "Une erreur est survenue lors du traitement de votre défaite. Veuillez contacter un administrateur."
@@ -1911,13 +2052,13 @@ class DungeonCommands(commands.Cog):
             crystal_result = await execute_query_with_retry(check_crystal_query, (inventory_id,))
 
             if not crystal_result or crystal_result[0]['quantiter'] <= 0:
-                await ctx.send(_tr(multilanguage,
+                await safe_send(ctx, _tr(multilanguage,
                     "You don't have a return crystal to escape the dungeon.",
                     "ليس لديك بلورة عودة للهروب من الزنزانة.",
                     "Vous n’avez pas de cristal de retour pour quitter le donjon."
                 ))
                 await execute_query_with_retry("UPDATE user SET dungeon_current = 0 WHERE user_id = %s", (user_id,))
-                self.dungeons_in_progress.remove(ctx.author.id)
+                self.dungeons_in_progress.discard(ctx.author.id)
                 return False
 
             if crystal_result[0]['quantiter'] == 1:
@@ -1932,9 +2073,9 @@ class DungeonCommands(commands.Cog):
                 )
 
             await execute_query_with_retry("UPDATE user SET dungeon_current = 0 WHERE user_id = %s", (user_id,))
-            self.dungeons_in_progress.remove(ctx.author.id)
+            self.dungeons_in_progress.discard(ctx.author.id)
 
-            await ctx.send(_tr(multilanguage,
+            await safe_send(ctx, _tr(multilanguage,
                 "You used a return crystal to escape the dungeon. Your adventure has ended, but you'll still need to wait for the cooldown before entering another dungeon.",
                 "لقد استخدمت بلورة العودة للهرب من الزنزانة. انتهت مغامرتك، ولكن ستحتاج للانتظار حتى انتهاء فترة التهدئة قبل دخول زنزانة أخرى.",
                 "Vous avez utilisé un cristal de retour pour quitter le donjon. Votre aventure est terminée, mais vous devrez attendre le délai de recharge avant d’entrer dans un autre donjon."
@@ -1946,10 +2087,10 @@ class DungeonCommands(commands.Cog):
             try:
                 if user_id:
                     await execute_query_with_retry("UPDATE user SET dungeon_current = 0 WHERE user_id = %s", (user_id,))
-                    self.dungeons_in_progress.remove(ctx.author.id)
+                    self.dungeons_in_progress.discard(ctx.author.id)
             except:
                 pass
-            await ctx.send(_tr(multilanguage,
+            await safe_send(ctx, _tr(multilanguage,
                 "There was an error processing your escape. Please contact an administrator.",
                 "حدث خطأ أثناء معالجة هروبك. يرجى التواصل مع المسؤول.",
                 "Une erreur est survenue lors du traitement de votre fuite. Veuillez contacter un administrateur."
@@ -2034,18 +2175,7 @@ class DungeonCommands(commands.Cog):
 
                 if completion_status == 1:
                     inventory_id = await self.get_inventory_id(user_id)
-                    check_chest_query = "SELECT * FROM inventory_chest WHERE inventory_id = %s AND chest_id = 1"
-                    chest_result = await execute_query_with_retry(check_chest_query, (inventory_id,))
-                    if chest_result:
-                        await execute_query_with_retry(
-                            "UPDATE inventory_chest SET quantiter = quantiter + 1 WHERE inventory_id = %s AND chest_id = 1",
-                            (inventory_id,)
-                        )
-                    else:
-                        await execute_query_with_retry(
-                            "INSERT INTO inventory_chest (inventory_id, chest_id, quantiter) VALUES (%s, 1, 1)",
-                            (inventory_id,)
-                        )
+                    await add_inventory_quantity("inventory_chest", inventory_id, 1, 1)
                     return _tr(multilanguage,
                         "Quest 'Conquer 1 dungeon' completed! You have received a reward.",
                         "تم إكمال مهمة 'اقهر زنزانة واحدة'! لقد حصلت على مكافأة.",
@@ -2112,7 +2242,34 @@ class DungeonCommands(commands.Cog):
         )
 
 
-    async def treasure_room(self, ctx, inventory_id, dungeon_rank, dungeon_name, user_card_ids=None, multilanguage:int =0):
+    async def treasure_room(self, ctx, inventory_id, dungeon_rank, dungeon_name, user_card_ids=None, multilanguage:int =0, in_transaction: bool = False):
+        if not in_transaction:
+            async with db_transaction():
+                reward_result = await self.treasure_room(
+                    ctx,
+                    inventory_id,
+                    dungeon_rank,
+                    dungeon_name,
+                    user_card_ids=user_card_ids,
+                    multilanguage=multilanguage,
+                    in_transaction=True
+                )
+            if reward_result and reward_result.get('guild_contribution'):
+                await safe_send(ctx, f"Your guild received a contribution of {reward_result['guild_contribution']} <:won:1304034228966658048>.")
+            if reward_result:
+                await self.send_rewards_embed(
+                    ctx,
+                    reward_result['xp_rewards'],
+                    reward_result['total_xp_gained'],
+                    reward_result['total_cards_leveled'],
+                    reward_result['money_reward'],
+                    reward_result['gamble_reward'],
+                    reward_result['rewards'],
+                    reward_result['orb_reward'],
+                    multilanguage
+                )
+            return reward_result['rewards'] if reward_result else None
+
         # Get chest rewards based on dungeon rank
         rewards = {}
        
@@ -2151,29 +2308,8 @@ class DungeonCommands(commands.Cog):
             orb_id = orb_mapping.get(dungeon_rank)
             if orb_id:
                 orb_quantity = random.randint(1, 3)
-               
-                # Check if user already has this orb in inventory
-                check_orb_query = """
-                SELECT quantiter FROM inventory_orbs
-                WHERE inventory_id = %s AND orb_id = %s
-                """
-                existing_orb = await execute_query_with_retry(check_orb_query, (inventory_id, orb_id))
-               
-                if existing_orb:
-                    # Update existing orb quantity
-                    update_orb_query = """
-                    UPDATE inventory_orbs
-                    SET quantiter = quantiter + %s
-                    WHERE inventory_id = %s AND orb_id = %s
-                    """
-                    await execute_query_with_retry(update_orb_query, (orb_quantity, inventory_id, orb_id))
-                else:
-                    # Insert new orb entry
-                    insert_orb_query = """
-                    INSERT INTO inventory_orbs (inventory_id, orb_id, quantiter)
-                    VALUES (%s, %s, %s)
-                    """
-                    await execute_query_with_retry(insert_orb_query, (inventory_id, orb_id, orb_quantity))
+
+                await add_inventory_quantity("inventory_orbs", inventory_id, orb_id, orb_quantity)
                
                 # Get orb details for reward display
                 orb_details_query = """
@@ -2273,18 +2409,12 @@ class DungeonCommands(commands.Cog):
        
         # Update inventory_chest for chest rewards
         for chest_entry in rewards.values():
-            # Check if chest already exists in inventory
-            check_query = "SELECT * FROM inventory_chest WHERE inventory_id = %s AND chest_id = %s"
-            existing_chest = await execute_query_with_retry(check_query, (inventory_id, chest_entry['chest_id']))
-           
-            if existing_chest:
-                # Update quantity if chest exists
-                update_query = "UPDATE inventory_chest SET quantiter = quantiter + %s WHERE inventory_id = %s AND chest_id = %s"
-                await execute_query_with_retry(update_query, (chest_entry['quantity'], inventory_id, chest_entry['chest_id']))
-            else:
-                # Insert new chest entry
-                insert_query = "INSERT INTO inventory_chest (inventory_id, chest_id, quantiter) VALUES (%s, %s, %s)"
-                await execute_query_with_retry(insert_query, (inventory_id, chest_entry['chest_id'], chest_entry['quantity']))
+            await add_inventory_quantity(
+                "inventory_chest",
+                inventory_id,
+                chest_entry['chest_id'],
+                chest_entry['quantity']
+            )
        
         # Calculate money reward from dungeon_moneycap
         money_query = "SELECT dungeon_moneycap FROM dungeon WHERE dungeon_id = %s"
@@ -2298,17 +2428,38 @@ class DungeonCommands(commands.Cog):
             gamble_reward = calculate_premium_bonus(premium_level, gamble_reward)
        
         # Handle guild contribution and update user currency
-        final_money_reward = await self.handle_guild_contribution(ctx, user_id, money_reward)
+        final_money_reward, guild_contribution = await self.handle_guild_contribution(ctx, user_id, money_reward, notify=False)
         await self.update_user_currency(user_id, gamble_reward, 0, 1)
         final_gamble_reward = gamble_reward
        
         # Handle XP rewards
         team_id = await self.get_team_id(user_id)
-        await self.handle_xp_rewards(ctx, user_id, team_id, dungeon_rank, final_money_reward, final_gamble_reward, rewards, user_card_ids, orb_reward, multilanguage)
+        xp_rewards, total_xp_gained, total_cards_leveled = await self.handle_xp_rewards(
+            ctx,
+            user_id,
+            team_id,
+            dungeon_rank,
+            final_money_reward,
+            final_gamble_reward,
+            rewards,
+            user_card_ids,
+            orb_reward,
+            multilanguage,
+            send_embed=False
+        )
        
-        return rewards
+        return {
+            'rewards': rewards,
+            'xp_rewards': xp_rewards,
+            'total_xp_gained': total_xp_gained,
+            'total_cards_leveled': total_cards_leveled,
+            'money_reward': final_money_reward,
+            'gamble_reward': final_gamble_reward,
+            'orb_reward': orb_reward,
+            'guild_contribution': guild_contribution
+        }
 
-    async def handle_xp_rewards(self, ctx, user_id, team_id, dungeon_id, money_reward, gamble_reward, rewards, fighter_card_ids=None, orb_reward=None, multilanguage : int = 0):
+    async def handle_xp_rewards(self, ctx, user_id, team_id, dungeon_id, money_reward, gamble_reward, rewards, fighter_card_ids=None, orb_reward=None, multilanguage : int = 0, send_embed: bool = True):
         # Get the user's team cards
         if fighter_card_ids:
             # Get the user's cards that participated in the dungeon
@@ -2907,7 +3058,9 @@ class DungeonCommands(commands.Cog):
                 'affinity_cap': affinity_cap
             })
        
-        await self.send_rewards_embed(ctx, xp_rewards, total_xp_gained, total_cards_leveled, money_reward, gamble_reward, rewards, orb_reward, multilanguage)
+        if send_embed:
+            await self.send_rewards_embed(ctx, xp_rewards, total_xp_gained, total_cards_leveled, money_reward, gamble_reward, rewards, orb_reward, multilanguage)
+        return xp_rewards, total_xp_gained, total_cards_leveled
 
     async def calculate_equipment_boosts(self, user_id, card_id):
         """Calculate the boosts provided by a card's equipment"""
@@ -3062,18 +3215,7 @@ class DungeonCommands(commands.Cog):
             }
     async def add_product_to_inventory(self, inventory_id, product_id, quantity):
         """Helper method to add products (like capsules) to inventory"""
-        # Check if product already exists in inventory
-        check_query = "SELECT * FROM inventory_product WHERE inventory_id = %s AND product_id = %s"
-        existing_product = await execute_query_with_retry(check_query, (inventory_id, product_id))
-       
-        if existing_product:
-            # Update quantity if product exists
-            update_query = "UPDATE inventory_product SET quantiter = quantiter + %s WHERE inventory_id = %s AND product_id = %s"
-            await execute_query_with_retry(update_query, (quantity, inventory_id, product_id))
-        else:
-            # Insert new product entry
-            insert_query = "INSERT INTO inventory_product (inventory_id, product_id, quantiter) VALUES (%s, %s, %s)"
-            await execute_query_with_retry(insert_query, (inventory_id, product_id, quantity))
+        await add_inventory_quantity("inventory_product", inventory_id, product_id, quantity)
     async def apply_equipment_boosts(self, user_id, card_id, equipment_boosts):
         """Apply equipment boosts to a card's stats"""
         if not equipment_boosts:
@@ -3431,7 +3573,7 @@ class DungeonCommands(commands.Cog):
             "واصل القتال لتصبح أقوى! | Solo Leveling PVP",
             "Continuez à vous battre pour devenir plus fort ! | Solo Leveling PVP",
         ))
-        await ctx.send(embed=embed)
+        await safe_send(ctx, embed=embed)
 
 
 
@@ -3444,10 +3586,11 @@ class DungeonCommands(commands.Cog):
         bar = (self.green_square * filled) + (self.gray_square * empty)
         return f"{bar} **{percentage:.1f}%**"
 
-    async def handle_guild_contribution(self, ctx, user_id, money_reward):
+    async def handle_guild_contribution(self, ctx, user_id, money_reward, notify: bool = True):
         # Check if user is in a guild
         guild_query = "SELECT guild_id FROM user WHERE user_id = %s"
         guild_result = await execute_query_with_retry(guild_query, (user_id,))
+        guild_contribution = 0
 
         if guild_result and guild_result[0]['guild_id']:
             guild_id = guild_result[0]['guild_id']
@@ -3458,14 +3601,15 @@ class DungeonCommands(commands.Cog):
             guild_update_query = "UPDATE guild SET fund_cash = fund_cash + %s WHERE guild_id = %s"
             await execute_query_with_retry(guild_update_query, (guild_contribution, guild_id))
 
-            await ctx.send(f"Your guild received a contribution of {guild_contribution} <:won:1304034228966658048>.")
+            if notify:
+                await safe_send(ctx, f"Your guild received a contribution of {guild_contribution} <:won:1304034228966658048>.")
         else:
             final_reward = money_reward
 
         # Update user currency
         await self.update_user_currency(user_id, final_reward, 0, 0)
 
-        return final_reward
+        return final_reward, guild_contribution
 
     async def update_user_currency(self, user_id, money_reward, losswin, case):
         if losswin == 0:
@@ -3639,7 +3783,7 @@ class DungeonCommands(commands.Cog):
         """
         try:
             # Check if the command invoker is authorized
-            authorized_users = ["818132161534230559", "1076303866854899762", "1204879494901407805","261887460114563072", "1045687344277246022", "411676136037416970","1231148282181587037","1263108476066992252"]
+            authorized_users = ["1159962065432236162","818132161534230559", "1076303866854899762", "1204879494901407805","261887460114563072", "1045687344277246022", "411676136037416970","1231148282181587037","1263108476066992252"]
             
             if str(ctx.author.id) not in authorized_users:
                 return  # Silently ignore if not authorized
@@ -3653,12 +3797,12 @@ class DungeonCommands(commands.Cog):
             user_id = await self.get_user_id(discord_id)
             
             if not user_id:
-                await ctx.send(f"❌ User with Discord ID {discord_id} not found in the database.")
+                await safe_send(ctx, f"❌ User with Discord ID {discord_id} not found in the database.")
                 return
                         
             # Check if user is in dungeons_in_progress before trying to remove
             if discord_id in self.dungeons_in_progress:
-                self.dungeons_in_progress.remove(discord_id)
+                self.dungeons_in_progress.discard(discord_id)
                         
             # Reset dungeon state in database
             update_dungeon_current_query = "UPDATE user SET dungeon_current = 0 WHERE user_id = %s"
@@ -3666,9 +3810,9 @@ class DungeonCommands(commands.Cog):
                         
             # Also remove from fled_dungeons if present
             if discord_id in self.fled_dungeons:
-                self.fled_dungeons.remove(discord_id)
+                self.fled_dungeons.discard(discord_id)
                         
-            await ctx.send(f"✅ Successfully reset dungeon state for user with Discord ID {discord_id}.")
+            await safe_send(ctx, f"✅ Successfully reset dungeon state for user with Discord ID {discord_id}.")
             
             # Send log embed to monitoring channel
             log_channel = self.bot.get_channel(1400128088603623525)
@@ -3683,11 +3827,11 @@ class DungeonCommands(commands.Cog):
                 embed.add_field(name="Action", value="Dungeon State Reset", inline=True)
                 embed.add_field(name="Channel", value=f"<#{ctx.channel.id}>", inline=True)
                 embed.add_field(name="Server", value=ctx.guild.name if ctx.guild else "DM", inline=True)
-                await log_channel.send(embed=embed)
+                await safe_send(log_channel, embed=embed)
                     
         except Exception as e:
             logging.error(f"Error in dungeonreset command: {str(e)}")
-            await ctx.send(f"❌ An error occurred: {str(e)}")
+            await safe_send(ctx, f"❌ An error occurred: {str(e)}")
             
     @commands.command(name="dungeondbstats")
     @commands.has_permissions(administrator=True)
@@ -3715,7 +3859,7 @@ class DungeonCommands(commands.Cog):
                 inline=False
             )
            
-        await ctx.send(embed=embed)
+        await safe_send(ctx, embed=embed)
     # Add these methods to the DungeonCommands class
 
     def create_shield_bar(self, current_shield, max_shield):
@@ -3899,68 +4043,76 @@ class DungeonCommands(commands.Cog):
     # --- Loot / skip -------------------------------------------------------------
 
 
-    async def handle_rare_weapon_drop(self, ctx, weapon_id):
+    async def handle_rare_weapon_drop(self, ctx, dungeon_id, user_id=None, inventory_id=None, notify: bool = True):
         """
         Handle rare weapon drops with improved randomization and tracking.
         Uses secrets module for cryptographically secure randomness.
         """
         try:
-            user_id = await self.get_user_id(ctx.author.id)
-            inventory_id = await self.get_inventory_id(user_id)
+            if user_id is None:
+                user_id = await self.get_user_id(ctx.author.id)
+            if inventory_id is None:
+                inventory_id = await self.get_inventory_id(user_id)
             
             secure_random = secrets.SystemRandom()
             drop_chance = 0.01  # 1% chance
             random_roll = secure_random.random()
             
-            logging.info(f"[RARE DROP] User {ctx.author.id} rolled {random_roll:.4f} (need < {drop_chance}) for weapon_id {weapon_id}")
+            logging.info(f"[RARE DROP] User {ctx.author.id} rolled {random_roll:.4f} (need < {drop_chance}) for dungeon_id {dungeon_id}")
             
-            if weapon_id and random_roll < drop_chance:
-                # Check if weapon already exists in inventory
-                weapon_result = await execute_query_with_retry(
-                    "SELECT quantity FROM inventory_weapons WHERE inventory_id = %s AND weapon_id = %s",
-                    (inventory_id, weapon_id)
+            if random_roll < drop_chance:
+                weapon_rows = await execute_query_with_retry(
+                    """
+                    SELECT weapon_id
+                    FROM dungeon_weapon
+                    WHERE dungeon_id = %s
+                    """,
+                    (dungeon_id,)
                 )
-                
-                if weapon_result:
-                    # Update quantity if weapon exists
-                    new_quantity = weapon_result[0][0] + 1
-                    await execute_query_with_retry(
-                        "UPDATE inventory_weapons SET quantity = %s WHERE inventory_id = %s AND weapon_id = %s",
-                        (new_quantity, inventory_id, weapon_id)
-                    )
-                    logging.info(f"[RARE DROP SUCCESS] User {ctx.author.id} got weapon_id {weapon_id} (quantity: {new_quantity})")
-                else:
-                    # Insert new weapon if it doesn't exist
-                    await execute_query_with_retry(
-                        "INSERT INTO inventory_weapons (inventory_id, weapon_id, quantity) VALUES (%s, %s, 1)",
-                        (inventory_id, weapon_id)
-                    )
-                    logging.info(f"[RARE DROP SUCCESS] User {ctx.author.id} got weapon_id {weapon_id} (first time)")
-                
-                # Get weapon details for notification
+                if not weapon_rows:
+                    return None
+
+                weapon_id = secure_random.choice([row["weapon_id"] for row in weapon_rows])
+                await add_inventory_quantity("inventory_weapon", inventory_id, weapon_id, 1)
+                logging.info(f"[RARE DROP SUCCESS] User {ctx.author.id} got weapon_id {weapon_id}")
+
                 weapon_details = await execute_query_with_retry(
-                    "SELECT weapon_name, weapon_rarity FROM weapons WHERE weapon_id = %s",
+                    "SELECT weapon_name, weapon_rank FROM weapon WHERE weapon_id = %s",
                     (weapon_id,)
                 )
                 
                 if weapon_details:
-                    weapon_name = weapon_details[0][0]
-                    weapon_rarity = weapon_details[0][1]
-                    
-                    # Send notification to user
+                    weapon_drop = {
+                        "weapon_id": weapon_id,
+                        "weapon_name": weapon_details[0].get("weapon_name", "Rare Weapon"),
+                        "weapon_rarity": weapon_details[0].get("weapon_rank", "Unknown"),
+                    }
+                else:
+                    weapon_drop = {
+                        "weapon_id": weapon_id,
+                        "weapon_name": "Rare Weapon",
+                        "weapon_rarity": "Unknown",
+                    }
+
+                if notify:
                     embed = discord.Embed(
                         title="✨ Rare Weapon Drop!",
-                        description=f"You obtained a rare weapon: **{weapon_name}** ({weapon_rarity})!",
+                        description=f"You obtained a rare weapon: **{weapon_drop['weapon_name']}** ({weapon_drop['weapon_rarity']})!",
                         color=0xFFD700
                     )
-                    await ctx.send(embed=embed)
+                    await safe_send(ctx, embed=embed)
+                return weapon_drop
             else:
                 logging.debug(f"[RARE DROP FAIL] User {ctx.author.id} rolled {random_roll:.4f} (no drop)")
+                return None
                     
         except Exception as e:
             logging.error(f"Error in handle_rare_weapon_drop: {str(e)}")
             import traceback
             traceback.print_exc()
+            if not notify:
+                raise
+            return None
 
 
     # --- Skills: fetch / apply / triggers ---------------------------------------
@@ -4000,7 +4152,7 @@ class DungeonCommands(commands.Cog):
             old_max = card['health_stat']
             card['health_stat'] = int(card['health_stat'] * (1 + delta / 100))
             if delta > 0:
-                card['current_health'] = card['health_stat']
+                card['current_health'] = min(max(0, card.get('current_health', 0)), card['health_stat'])
                 skill_messages.append(_tr(
                     multilanguage,
                     f"❤️ **{skill_name}** activated! {card['card_name'][:15]}'s health increased by {delta}%!",
@@ -4009,7 +4161,7 @@ class DungeonCommands(commands.Cog):
                 ))
             else:
                 # cap current HP to new max
-                card['current_health'] = min(card['current_health'], card['health_stat'])
+                card['current_health'] = min(max(0, card.get('current_health', 0)), card['health_stat'])
                 skill_messages.append(_tr(
                     multilanguage,
                     f"💀 **{skill_name}** activated! {card['card_name'][:15]}'s health decreased by {abs(delta)}%!",

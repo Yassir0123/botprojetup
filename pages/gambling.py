@@ -7,6 +7,7 @@ import asyncio
 import math
 from typing import Optional
 from utils.database import execute_query_with_retry, get_metrics, db_transaction, command_lock
+from utils.db_atomic import db_transaction as atomic_db_transaction
 import functools
 async def get_user_multilanguage(user_authorid: int) -> int:
     """
@@ -211,6 +212,81 @@ class GamblingCommands(commands.Cog):
                 "UPDATE `user` SET gamble_currency = %s WHERE user_authorid = %s",
                 (new_balance, user_authorid)
             )
+
+    async def settle_coinflip_bet(self, user_authorid, bet, winnings):
+        async with atomic_db_transaction():
+            rows = await execute_query_with_retry(
+                "SELECT user_id, gamble_currency FROM `user` WHERE user_authorid = %s FOR UPDATE",
+                (user_authorid,)
+            )
+            if not rows:
+                return None
+
+            current_balance = rows[0]['gamble_currency']
+            if current_balance < bet:
+                return {
+                    'ok': False,
+                    'current_balance': current_balance,
+                    'new_balance': current_balance
+                }
+
+            new_balance = current_balance - bet + winnings
+            await execute_query_with_retry(
+                "UPDATE `user` SET gamble_currency = %s WHERE user_authorid = %s",
+                (new_balance, user_authorid)
+            )
+            return {
+                'ok': True,
+                'current_balance': current_balance,
+                'new_balance': new_balance
+            }
+
+    async def settle_duel_bet(self, initiator_user_id, target_user_id, winner_user_id, bet):
+        first_id, second_id = sorted([initiator_user_id, target_user_id])
+        async with atomic_db_transaction():
+            rows = await execute_query_with_retry(
+                """
+                SELECT user_id, gamble_currency
+                FROM `user`
+                WHERE user_id IN (%s, %s)
+                ORDER BY user_id
+                FOR UPDATE
+                """,
+                (first_id, second_id)
+            )
+            balances = {row['user_id']: row['gamble_currency'] for row in rows}
+            if len(balances) != 2:
+                return None
+
+            if balances[initiator_user_id] < bet or balances[target_user_id] < bet:
+                return {
+                    'ok': False,
+                    'initiator_balance': balances[initiator_user_id],
+                    'target_balance': balances[target_user_id]
+                }
+
+            new_initiator_balance = balances[initiator_user_id] - bet
+            new_target_balance = balances[target_user_id] - bet
+
+            if winner_user_id == initiator_user_id:
+                new_initiator_balance += bet * 2
+            else:
+                new_target_balance += bet * 2
+
+            await execute_query_with_retry(
+                "UPDATE `user` SET gamble_currency = %s WHERE user_id = %s",
+                (new_initiator_balance, initiator_user_id)
+            )
+            await execute_query_with_retry(
+                "UPDATE `user` SET gamble_currency = %s WHERE user_id = %s",
+                (new_target_balance, target_user_id)
+            )
+
+            return {
+                'ok': True,
+                'initiator_balance': new_initiator_balance,
+                'target_balance': new_target_balance
+            }
 
     #@commands.command(name='slot', aliases=["slt","slots"])
     async def slot_command(self, ctx, bet: int = 1):
@@ -797,10 +873,6 @@ class GamblingCommands(commands.Cog):
                 if not side:
                     side = random.choice(['heads', 'tails'])
 
-                # Deduct bet amount immediately
-                current_balance -= bet
-                await self.update_user_currency(str(ctx.author.id), current_balance)
-
                 flip_embed = discord.Embed(
                     title=_tr(lang, "🪙 Coinflip in Progress 🪙",
                               "🪙 قرعة العملة جارية 🪙",
@@ -817,22 +889,37 @@ class GamblingCommands(commands.Cog):
                 if computer_side == side:
                     # Win - give double the bet amount
                     winnings = bet * 2
-                    new_balance = current_balance + winnings
                     result_color = discord.Color.green()
                     result_title = _tr(lang, "🎉 You Won!", "🎉 لقد فزت!", "🎉 Tu as gagné !")
                     result_desc = _tr(lang, f"Congratulations! You won {winnings} currency!",
                                       f"تهانينا! ربحت {winnings} عملة!",
                                       f"Félicitations ! Tu as gagné {winnings} monnaie !")
-                    
-                    # Update database with winnings
-                    await self.update_user_currency(str(ctx.author.id), new_balance)
+
                 else:
-                    # Loss - bet amount already deducted
+                    # Loss
                     winnings = 0
-                    new_balance = current_balance
                     result_color = discord.Color.red()
                     result_title = _tr(lang, "😢 Better Luck Next Time", "😢 حظاً أوفر في المرة القادمة", "😢 Bonne chance la prochaine fois")
                     result_desc = _tr(lang, f"You lost {bet} currency.", f"لقد خسرت {bet} عملة.", f"Tu as perdu {bet} monnaie.")
+
+                settlement = await self.settle_coinflip_bet(str(ctx.author.id), bet, winnings)
+                if not settlement:
+                    await flip_message.edit(embed=discord.Embed(
+                        description=_tr(lang, "User not found in the database.",
+                                        "المستخدم غير موجود في قاعدة البيانات.",
+                                        "Utilisateur introuvable dans la base de données."),
+                        color=discord.Color.red()
+                    ))
+                    return
+                if not settlement['ok']:
+                    await flip_message.edit(embed=discord.Embed(
+                        description=_tr(lang, f"❌ Insufficient funds! Your current balance is {settlement['current_balance']} currency.",
+                                        f"❌ أموال غير كافية! رصيدك الحالي هو {settlement['current_balance']}.",
+                                        f"❌ Fonds insuffisants ! Votre solde actuel est de {settlement['current_balance']}."),
+                        color=discord.Color.red()
+                    ))
+                    return
+                new_balance = settlement['new_balance']
 
                 result_embed = discord.Embed(
                     title=result_title,
@@ -1204,13 +1291,6 @@ class GamblingCommands(commands.Cog):
                         await invite_message.edit(embed=decline_embed)
                         return
 
-                    # If user accepts - deduct bets from both players immediately
-                    await self.deduct_bet_from_users(initiator_user_id, target_user_id, bet)
-
-                    # Update local balance variables
-                    initiator_balance -= bet
-                    target_balance -= bet
-
                     toss_embed = discord.Embed(
                         title=_tr(lang, "🎲 Duel in Progress", "🎲 المبارزة جارية", "🎲 Duel en cours"),
                         description=_tr(lang, "Flipping the coin...", "جاري قلب العملة...", "On lance la pièce..."),
@@ -1225,16 +1305,26 @@ class GamblingCommands(commands.Cog):
 
                     # Update balances based on who won
                     if winner == ctx.author:
-                        new_initiator_balance = initiator_balance + (bet * 2)
-                        new_target_balance = target_balance
                         winner_id = initiator_user_id
                     else:
-                        new_initiator_balance = initiator_balance
-                        new_target_balance = target_balance + (bet * 2)
                         winner_id = target_user_id
 
-                    # Update winner's balance in database
-                    await self.award_winner(winner_id, bet * 2)
+                    settlement = await self.settle_duel_bet(initiator_user_id, target_user_id, winner_id, bet)
+                    if not settlement:
+                        await invite_message.edit(embed=discord.Embed(
+                            description="One or both users are not registered in the database.",
+                            color=discord.Color.red()
+                        ))
+                        return
+                    if not settlement['ok']:
+                        await invite_message.edit(embed=discord.Embed(
+                            description="One or both users no longer have enough currency to complete this duel.",
+                            color=discord.Color.red()
+                        ))
+                        return
+
+                    new_initiator_balance = settlement['initiator_balance']
+                    new_target_balance = settlement['target_balance']
 
                     # Result embed
                     result_embed = discord.Embed(

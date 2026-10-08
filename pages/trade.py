@@ -4,6 +4,8 @@ import asyncio
 import time
 from datetime import datetime, timedelta
 from utils.database import execute_query_with_retry, get_metrics
+from utils.activity_state import active_activity_message, block_during_user_activity, create_trade_status_row, get_active_user_activities
+from utils.db_atomic import db_transaction
 import functools
 def merge_label(langs, en, ar, fr):
     """Return a single label that includes the languages used by the two users."""
@@ -319,29 +321,8 @@ class TradeCommands(commands.Cog):
 
     async def create_trade_entry(self, initiator_id, target_id):
         """Create a new trade entry in the database"""
-        # First, check if either user is already in a trade
-        if await self.is_user_in_trade(initiator_id) or await self.is_user_in_trade(target_id):
-            return None
-       
-        # Create a new trade entry
-        query = """
-        INSERT INTO trade_status (initiator_id, target_id, status, created_at)
-        VALUES (%s, %s, 'pending', %s)
-        """
         current_time = datetime.now()
-        await execute_query_with_retry(query, (initiator_id, target_id, current_time))
-       
-        # Get the ID of the newly created trade
-        get_id_query = """
-        SELECT id_tradestatus FROM trade_status
-        WHERE initiator_id = %s AND target_id = %s
-        ORDER BY created_at DESC LIMIT 1
-        """
-        result = await execute_query_with_retry(get_id_query, (initiator_id, target_id))
-       
-        if result:
-            return result[0]['id_tradestatus']
-        return None
+        return await create_trade_status_row(initiator_id, target_id, current_time)
 
     async def update_trade_status(self, trade_id, status):
         """Update the status of a trade"""
@@ -992,6 +973,196 @@ class TradeCommands(commands.Cog):
            
             return True
 
+        async def apply_trade_transaction(self):
+            """Move both offers in one short transaction after both users confirm."""
+            async with db_transaction() as tx:
+                trade_row = await tx.fetchone(
+                    "SELECT id_tradestatus FROM trade_status WHERE id_tradestatus = %s FOR UPDATE",
+                    (self.trade_id,)
+                )
+                if not trade_row:
+                    raise RuntimeError("This trade is no longer active.")
+
+                initiator_user = await tx.fetchone(
+                    "SELECT won_currency FROM user WHERE user_id = %s FOR UPDATE",
+                    (self.initiator_id,)
+                )
+                target_user = await tx.fetchone(
+                    "SELECT won_currency FROM user WHERE user_id = %s FOR UPDATE",
+                    (self.target_id,)
+                )
+                if not initiator_user or not target_user:
+                    raise RuntimeError("One of the trade users could not be found.")
+
+                initiator_balance_before = initiator_user["won_currency"] or 0
+                target_balance_before = target_user["won_currency"] or 0
+                if initiator_balance_before < self.initiator_money:
+                    raise RuntimeError("Initiator no longer has enough Won.")
+                if target_balance_before < self.target_money:
+                    raise RuntimeError("Target no longer has enough Won.")
+
+                for inventory_id, offer in (
+                    (self.initiator_inventory_id, self.initiator_offer),
+                    (self.target_inventory_id, self.target_offer),
+                ):
+                    for item in offer:
+                        inv_table, _, _, _, inv_id_col = self.cog.item_tables[item["category"]]
+                        row = await tx.fetchone(
+                            f"""
+                            SELECT quantiter
+                            FROM {inv_table}
+                            WHERE inventory_id = %s AND {inv_id_col} = %s
+                            FOR UPDATE
+                            """,
+                            (inventory_id, item["id"])
+                        )
+                        if not row or row["quantiter"] < item["quantity"]:
+                            raise RuntimeError(f"Not enough {item['name']} to complete the trade.")
+
+                for item in self.initiator_offer:
+                    inv_table, _, _, _, inv_id_col = self.cog.item_tables[item["category"]]
+                    row = await tx.fetchone(
+                        f"SELECT quantiter FROM {inv_table} WHERE inventory_id = %s AND {inv_id_col} = %s FOR UPDATE",
+                        (self.initiator_inventory_id, item["id"])
+                    )
+                    if row["quantiter"] == item["quantity"]:
+                        await tx.execute(
+                            f"DELETE FROM {inv_table} WHERE inventory_id = %s AND {inv_id_col} = %s",
+                            (self.initiator_inventory_id, item["id"])
+                        )
+                    else:
+                        await tx.execute(
+                            f"UPDATE {inv_table} SET quantiter = quantiter - %s WHERE inventory_id = %s AND {inv_id_col} = %s",
+                            (item["quantity"], self.initiator_inventory_id, item["id"])
+                        )
+
+                for item in self.target_offer:
+                    inv_table, _, _, _, inv_id_col = self.cog.item_tables[item["category"]]
+                    row = await tx.fetchone(
+                        f"SELECT quantiter FROM {inv_table} WHERE inventory_id = %s AND {inv_id_col} = %s FOR UPDATE",
+                        (self.target_inventory_id, item["id"])
+                    )
+                    if row["quantiter"] == item["quantity"]:
+                        await tx.execute(
+                            f"DELETE FROM {inv_table} WHERE inventory_id = %s AND {inv_id_col} = %s",
+                            (self.target_inventory_id, item["id"])
+                        )
+                    else:
+                        await tx.execute(
+                            f"UPDATE {inv_table} SET quantiter = quantiter - %s WHERE inventory_id = %s AND {inv_id_col} = %s",
+                            (item["quantity"], self.target_inventory_id, item["id"])
+                        )
+
+                if self.initiator_money > 0:
+                    await tx.execute(
+                        "UPDATE user SET won_currency = won_currency - %s WHERE user_id = %s",
+                        (self.initiator_money, self.initiator_id)
+                    )
+                    await tx.execute(
+                        "UPDATE user SET won_currency = won_currency + %s WHERE user_id = %s",
+                        (self.initiator_money, self.target_id)
+                    )
+
+                if self.target_money > 0:
+                    await tx.execute(
+                        "UPDATE user SET won_currency = won_currency - %s WHERE user_id = %s",
+                        (self.target_money, self.target_id)
+                    )
+                    await tx.execute(
+                        "UPDATE user SET won_currency = won_currency + %s WHERE user_id = %s",
+                        (self.target_money, self.initiator_id)
+                    )
+
+                for item in self.initiator_offer:
+                    inv_table, _, _, _, inv_id_col = self.cog.item_tables[item["category"]]
+                    row = await tx.fetchone(
+                        f"SELECT quantiter FROM {inv_table} WHERE inventory_id = %s AND {inv_id_col} = %s FOR UPDATE",
+                        (self.target_inventory_id, item["id"])
+                    )
+                    if row:
+                        await tx.execute(
+                            f"UPDATE {inv_table} SET quantiter = quantiter + %s WHERE inventory_id = %s AND {inv_id_col} = %s",
+                            (item["quantity"], self.target_inventory_id, item["id"])
+                        )
+                    else:
+                        await tx.execute(
+                            f"INSERT INTO {inv_table} (inventory_id, {inv_id_col}, quantiter) VALUES (%s, %s, %s)",
+                            (self.target_inventory_id, item["id"], item["quantity"])
+                        )
+
+                for item in self.target_offer:
+                    inv_table, _, _, _, inv_id_col = self.cog.item_tables[item["category"]]
+                    row = await tx.fetchone(
+                        f"SELECT quantiter FROM {inv_table} WHERE inventory_id = %s AND {inv_id_col} = %s FOR UPDATE",
+                        (self.initiator_inventory_id, item["id"])
+                    )
+                    if row:
+                        await tx.execute(
+                            f"UPDATE {inv_table} SET quantiter = quantiter + %s WHERE inventory_id = %s AND {inv_id_col} = %s",
+                            (item["quantity"], self.initiator_inventory_id, item["id"])
+                        )
+                    else:
+                        await tx.execute(
+                            f"INSERT INTO {inv_table} (inventory_id, {inv_id_col}, quantiter) VALUES (%s, %s, %s)",
+                            (self.initiator_inventory_id, item["id"], item["quantity"])
+                        )
+
+                for user_id, inventory_id in (
+                    (self.initiator_id, self.initiator_inventory_id),
+                    (self.target_id, self.target_inventory_id),
+                ):
+                    quest = await tx.fetchone(
+                        """
+                        SELECT uq.userquests_id, uq.quest_id, uq.current_count, uq.completion_status,
+                               q.quest_name, q.required_count
+                        FROM user_quests uq
+                        JOIN quest q ON uq.quest_id = q.quest_id
+                        WHERE uq.user_id = %s AND q.quest_name = 'Trade 3 items' AND uq.completion_status = 0
+                        FOR UPDATE
+                        """,
+                        (user_id,)
+                    )
+                    if quest:
+                        new_count = quest["current_count"] + 1
+                        await tx.execute(
+                            "UPDATE user_quests SET current_count = %s WHERE userquests_id = %s",
+                            (new_count, quest["userquests_id"])
+                        )
+                        if new_count >= quest["required_count"]:
+                            await tx.execute(
+                                "UPDATE user_quests SET completion_status = 1 WHERE userquests_id = %s",
+                                (quest["userquests_id"],)
+                            )
+                            chest = await tx.fetchone(
+                                "SELECT quantiter FROM inventory_chest WHERE inventory_id = %s AND chest_id = 1 FOR UPDATE",
+                                (inventory_id,)
+                            )
+                            if chest:
+                                await tx.execute(
+                                    "UPDATE inventory_chest SET quantiter = quantiter + 1 WHERE inventory_id = %s AND chest_id = 1",
+                                    (inventory_id,)
+                                )
+                            else:
+                                await tx.execute(
+                                    "INSERT INTO inventory_chest (inventory_id, chest_id, quantiter) VALUES (%s, 1, 1)",
+                                    (inventory_id,)
+                                )
+
+                initiator_after = await tx.fetchone(
+                    "SELECT won_currency FROM user WHERE user_id = %s",
+                    (self.initiator_id,)
+                )
+                target_after = await tx.fetchone(
+                    "SELECT won_currency FROM user WHERE user_id = %s",
+                    (self.target_id,)
+                )
+                return (
+                    initiator_balance_before,
+                    target_balance_before,
+                    (initiator_after or {}).get("won_currency", 0) or 0,
+                    (target_after or {}).get("won_currency", 0) or 0,
+                )
+
         async def process_trade(self):
             # Prevent double processing
             if self.is_processing:
@@ -1013,135 +1184,13 @@ class TradeCommands(commands.Cog):
                 # STOP THE VIEW IMMEDIATELY to prevent further interactions
                 self.stop()
                
-                # Get current balances for logging
-                initiator_balance_before = 0
-                target_balance_before = 0
-
-                query = "SELECT won_currency FROM user WHERE user_id = %s"
-                result = await execute_query_with_retry(query, (self.initiator_id,))
-                if result:
-                    initiator_balance_before = result[0]['won_currency'] or 0
-
-                result = await execute_query_with_retry(query, (self.target_id,))
-                if result:
-                    target_balance_before = result[0]['won_currency'] or 0
-
                 try:
-                    # STEP 1: Remove initiator's items from initiator's inventory
-                    for item in self.initiator_offer:
-                        inv_table, _, _, id_col, inv_id_col = self.cog.item_tables[item['category']]
-                        query = f"SELECT quantiter FROM {inv_table} WHERE inventory_id = %s AND {inv_id_col} = %s"
-                        result = await execute_query_with_retry(query, (self.initiator_inventory_id, item['id']))
-                       
-                        if result:
-                            current_quantity = result[0]['quantiter']
-                            if current_quantity == item['quantity']:
-                                query = f"DELETE FROM {inv_table} WHERE inventory_id = %s AND {inv_id_col} = %s"
-                                await execute_query_with_retry(query, (self.initiator_inventory_id, item['id']))
-                            else:
-                                query = f"UPDATE {inv_table} SET quantiter = quantiter - %s WHERE inventory_id = %s AND {inv_id_col} = %s"
-                                await execute_query_with_retry(query, (item['quantity'], self.initiator_inventory_id, item['id']))
-
-                    # STEP 2: Remove target's items from target's inventory
-                    for item in self.target_offer:
-                        inv_table, _, _, id_col, inv_id_col = self.cog.item_tables[item['category']]
-                        query = f"SELECT quantiter FROM {inv_table} WHERE inventory_id = %s AND {inv_id_col} = %s"
-                        result = await execute_query_with_retry(query, (self.target_inventory_id, item['id']))
-                       
-                        if result:
-                            current_quantity = result[0]['quantiter']
-                            if current_quantity == item['quantity']:
-                                query = f"DELETE FROM {inv_table} WHERE inventory_id = %s AND {inv_id_col} = %s"
-                                await execute_query_with_retry(query, (self.target_inventory_id, item['id']))
-                            else:
-                                query = f"UPDATE {inv_table} SET quantiter = quantiter - %s WHERE inventory_id = %s AND {inv_id_col} = %s"
-                                await execute_query_with_retry(query, (item['quantity'], self.target_inventory_id, item['id']))
-
-                    # STEP 3: Process currency exchange (remove from each user what they're giving)
-                    if self.initiator_money > 0:
-                        query = "UPDATE user SET won_currency = won_currency - %s WHERE user_id = %s"
-                        await execute_query_with_retry(query, (self.initiator_money, self.initiator_id))
-
-                    if self.target_money > 0:
-                        query = "UPDATE user SET won_currency = won_currency - %s WHERE user_id = %s"
-                        await execute_query_with_retry(query, (self.target_money, self.target_id))
-
-                    # STEP 4: Add initiator's items to target's inventory
-                    for item in self.initiator_offer:
-                        inv_table, _, _, id_col, inv_id_col = self.cog.item_tables[item['category']]
-                        query = f"SELECT quantiter FROM {inv_table} WHERE inventory_id = %s AND {inv_id_col} = %s"
-                        result = await execute_query_with_retry(query, (self.target_inventory_id, item['id']))
-                       
-                        if result:
-                            query = f"UPDATE {inv_table} SET quantiter = quantiter + %s WHERE inventory_id = %s AND {inv_id_col} = %s"
-                            await execute_query_with_retry(query, (item['quantity'], self.target_inventory_id, item['id']))
-                        else:
-                            query = f"INSERT INTO {inv_table} (inventory_id, {inv_id_col}, quantiter) VALUES (%s, %s, %s)"
-                            await execute_query_with_retry(query, (self.target_inventory_id, item['id'], item['quantity']))
-
-                    # STEP 5: Add target's items to initiator's inventory
-                    for item in self.target_offer:
-                        inv_table, _, _, id_col, inv_id_col = self.cog.item_tables[item['category']]
-                        query = f"SELECT quantiter FROM {inv_table} WHERE inventory_id = %s AND {inv_id_col} = %s"
-                        result = await execute_query_with_retry(query, (self.initiator_inventory_id, item['id']))
-                       
-                        if result:
-                            query = f"UPDATE {inv_table} SET quantiter = quantiter + %s WHERE inventory_id = %s AND {inv_id_col} = %s"
-                            await execute_query_with_retry(query, (item['quantity'], self.initiator_inventory_id, item['id']))
-                        else:
-                            query = f"INSERT INTO {inv_table} (inventory_id, {inv_id_col}, quantiter) VALUES (%s, %s, %s)"
-                            await execute_query_with_retry(query, (self.initiator_inventory_id, item['id'], item['quantity']))
-
-                    # STEP 6: Add currency to recipients
-                    if self.initiator_money > 0:
-                        query = "UPDATE user SET won_currency = won_currency + %s WHERE user_id = %s"
-                        await execute_query_with_retry(query, (self.initiator_money, self.target_id))
-
-                    if self.target_money > 0:
-                        query = "UPDATE user SET won_currency = won_currency + %s WHERE user_id = %s"
-                        await execute_query_with_retry(query, (self.target_money, self.initiator_id))
-
-                    # STEP 7: Process quest progress for both users
-                    for user_id, inventory_id in [(self.initiator_id, self.initiator_inventory_id), (self.target_id, self.target_inventory_id)]:
-                        quest_query = """
-                        SELECT uq.userquests_id, uq.quest_id, uq.current_count, uq.completion_status,
-                               q.quest_name, q.required_count
-                        FROM user_quests uq
-                        JOIN quest q ON uq.quest_id = q.quest_id
-                        WHERE uq.user_id = %s AND q.quest_name = 'Trade 3 items' AND uq.completion_status = 0
-                        """
-                        result = await execute_query_with_retry(quest_query, (user_id,))
-                       
-                        if result:
-                            quest = result[0]
-                            new_count = quest['current_count'] + 1
-                           
-                            query = "UPDATE user_quests SET current_count = %s WHERE userquests_id = %s"
-                            await execute_query_with_retry(query, (new_count, quest['userquests_id']))
-                           
-                            if new_count >= quest['required_count']:
-                                query = "UPDATE user_quests SET completion_status = 1 WHERE userquests_id = %s"
-                                await execute_query_with_retry(query, (quest['userquests_id'],))
-                               
-                                query = """
-                                INSERT INTO inventory_chest (inventory_id, chest_id, quantiter)
-                                VALUES (%s, %s, 1)
-                                ON DUPLICATE KEY UPDATE quantiter = quantiter + 1
-                                """
-                                await execute_query_with_retry(query, (inventory_id, 1))
-
-                    # Get updated balances for logging
-                    initiator_balance_after = 0
-                    target_balance_after = 0
-
-                    query = "SELECT won_currency FROM user WHERE user_id = %s"
-                    result = await execute_query_with_retry(query, (self.initiator_id,))
-                    if result:
-                        initiator_balance_after = result[0]['won_currency'] or 0
-
-                    result = await execute_query_with_retry(query, (self.target_id,))
-                    if result:
-                        target_balance_after = result[0]['won_currency'] or 0
+                    (
+                        initiator_balance_before,
+                        target_balance_before,
+                        initiator_balance_after,
+                        target_balance_after,
+                    ) = await self.apply_trade_transaction()
 
                 except Exception as e:
                     print(f"Error processing trade: {e}")
@@ -1453,6 +1502,7 @@ class TradeCommands(commands.Cog):
 
     @commands.command(aliases=["tr", "td"])
     @command_cooldown(1, 3.0)
+    @block_during_user_activity()
     async def trade(self, ctx, target: discord.Member):
         start_time = time.time()
         lang = await self._get_lang(ctx.author.id)
@@ -1473,6 +1523,11 @@ class TradeCommands(commands.Cog):
                                f"{EMOJI_CANCEL} لا يمكنك التداول مع بوت!",
                                f"{EMOJI_CANCEL} Vous ne pouvez pas échanger avec un bot !"))
             return
+        target_activities = await get_active_user_activities(str(target.id), user_column="user_authorid")
+        if target_activities:
+            await ctx.send(active_activity_message(lang, target_activities))
+            return
+
         initiator_status = await self.check_user_operation_status(ctx.author.id)
         print("status")
         print(initiator_status)

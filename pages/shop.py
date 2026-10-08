@@ -8,6 +8,8 @@ import asyncio
 import random
 from datetime import datetime, timedelta
 from utils.database import execute_query_with_retry, get_metrics
+from utils.activity_state import block_during_user_activity, claim_user_status_row
+from utils.db_atomic import db_transaction
 import os
 # =========================
 # Multilanguage helpers
@@ -631,6 +633,197 @@ class ShopCommands(commands.Cog):
        
         return original_price, False
 
+    async def _apply_shop_purchase_transaction(self, user_id, item_type, item_details, quantity, final_price, currency_column):
+        async with db_transaction() as tx:
+            user_row = await tx.fetchone(
+                f"SELECT {currency_column} FROM user WHERE user_id = %s FOR UPDATE",
+                (user_id,)
+            )
+            if not user_row:
+                raise RuntimeError("User not found.")
+            current_currency = user_row[currency_column] or 0
+            if current_currency < final_price:
+                raise RuntimeError("You no longer have enough currency for this purchase.")
+
+            inv_res = await tx.fetchone(
+                "SELECT inventory_id FROM inventory WHERE user_id = %s FOR UPDATE",
+                (user_id,)
+            )
+            if not inv_res:
+                raise RuntimeError("Error: You don't have an inventory.")
+            inventory_id = inv_res['inventory_id']
+
+            new_currency = current_currency - final_price
+            await tx.execute(
+                f"UPDATE user SET {currency_column} = %s WHERE user_id = %s",
+                (new_currency, user_id)
+            )
+
+            if item_type == 'halloween_weapon':
+                weapon_id = item_details['weapon_id']
+                weapon_name = item_details['weapon_name']
+
+                for _ in range(quantity):
+                    attack_boost = 0
+                    health_boost = 0
+                    speed_boost = 0
+                    defense_boost = 0
+                    attack_percentage = 0
+                    health_percentage = 0
+                    speed_percentage = 0
+                    defense_percentage = 0
+
+                    if item_details.get('min_attackboost') and item_details.get('max_attackboost'):
+                        if item_details['min_attackboost'] != 0 or item_details['max_attackboost'] != 0:
+                            attack_boost = random.randint(item_details['min_attackboost'] // 5, item_details['max_attackboost'] // 5) * 5
+                    if item_details.get('min_attackpercentage') and item_details.get('max_attackpercentage'):
+                        if item_details['min_attackpercentage'] != 0 or item_details['max_attackpercentage'] != 0:
+                            attack_percentage = random.randint(item_details['min_attackpercentage'], item_details['max_attackpercentage'])
+                    if item_details.get('min_healthboost') and item_details.get('max_healthboost'):
+                        if item_details['min_healthboost'] != 0 or item_details['max_healthboost'] != 0:
+                            health_boost = random.randint(item_details['min_healthboost'] // 5, item_details['max_healthboost'] // 5) * 5
+                    if item_details.get('min_healthpercentage') and item_details.get('max_healthpercentage'):
+                        if item_details['min_healthpercentage'] != 0 or item_details['max_healthpercentage'] != 0:
+                            health_percentage = random.randint(item_details['min_healthpercentage'], item_details['max_healthpercentage'])
+                    if item_details.get('min_speedboost') and item_details.get('max_speedboost'):
+                        if item_details['min_speedboost'] != 0 or item_details['max_speedboost'] != 0:
+                            speed_boost = random.randint(item_details['min_speedboost'] // 5, item_details['max_speedboost'] // 5) * 5
+                    if item_details.get('min_speedpercentage') and item_details.get('max_speedpercentage'):
+                        if item_details['min_speedpercentage'] != 0 or item_details['max_speedpercentage'] != 0:
+                            speed_percentage = random.randint(item_details['min_speedpercentage'], item_details['max_speedpercentage'])
+                    if item_details.get('min_defenseboost') and item_details.get('max_defenseboost'):
+                        if item_details['min_defenseboost'] != 0 or item_details['max_defenseboost'] != 0:
+                            defense_boost = random.randint(item_details['min_defenseboost'] // 5, item_details['max_defenseboost'] // 5) * 5
+                    if item_details.get('min_defensepercentage') and item_details.get('max_defensepercentage'):
+                        if item_details['min_defensepercentage'] != 0 or item_details['max_defensepercentage'] != 0:
+                            defense_percentage = random.randint(item_details['min_defensepercentage'], item_details['max_defensepercentage'])
+
+                    existing_weapons = await tx.fetchall(
+                        """
+                        SELECT weapon_surname
+                        FROM weapon_halloween
+                        WHERE inventory_id = %s AND weapon_id = %s
+                        ORDER BY id_weaponhalloween DESC
+                        FOR UPDATE
+                        """,
+                        (inventory_id, weapon_id)
+                    )
+
+                    weapon_surname = weapon_name
+                    if existing_weapons:
+                        last_surname = existing_weapons[0]['weapon_surname']
+                        if last_surname == weapon_name:
+                            weapon_surname = f"{weapon_name}_2"
+                        elif '_' in last_surname:
+                            parts = last_surname.rsplit('_', 1)
+                            if len(parts) == 2 and parts[1].isdigit():
+                                weapon_surname = f"{weapon_name}_{int(parts[1]) + 1}"
+                            else:
+                                weapon_surname = f"{weapon_name}_2"
+                        else:
+                            weapon_surname = f"{weapon_name}_2"
+
+                    await tx.execute(
+                        """
+                        INSERT INTO weapon_halloween
+                        (inventory_id, weapon_id, weapon_surname, quantiter,
+                         attack_boost, health_boost, speed_boost, defense_boost,
+                         attack_percentage, health_percentage, speed_percentage, defense_percentage)
+                        VALUES (%s, %s, %s, 1, %s, %s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        (inventory_id, weapon_id, weapon_surname,
+                         attack_boost, health_boost, speed_boost, defense_boost,
+                         attack_percentage, health_percentage, speed_percentage, defense_percentage)
+                    )
+            elif item_type == 'card_skin':
+                skin_id = item_details['skin_id']
+                existing_skin = await tx.fetchone(
+                    "SELECT quantiter FROM inventory_skins WHERE inventory_id = %s AND skin_id = %s FOR UPDATE",
+                    (inventory_id, skin_id)
+                )
+                if existing_skin:
+                    await tx.execute(
+                        "UPDATE inventory_skins SET quantiter = quantiter + %s WHERE inventory_id = %s AND skin_id = %s",
+                        (quantity, inventory_id, skin_id)
+                    )
+                else:
+                    await tx.execute(
+                        "INSERT INTO inventory_skins (inventory_id, skin_id, quantiter) VALUES (%s, %s, %s)",
+                        (inventory_id, skin_id, quantity)
+                    )
+            else:
+                table_map = {
+                    'weapon': 'inventory_weapon',
+                    'product': 'inventory_product',
+                    'dungeonkey': 'inventory_dungeonkey',
+                    'pickaxe': 'inventory_pickaxe',
+                    'skill': 'inventory_skills'
+                }
+                inventory_table = table_map[item_type]
+                item_id_column = 'id_pickaxe' if item_type == 'pickaxe' else f"{item_type}_id"
+                item_id = item_details[item_id_column]
+
+                existing_item = await tx.fetchone(
+                    f"SELECT * FROM {inventory_table} WHERE inventory_id = %s AND {item_id_column} = %s FOR UPDATE",
+                    (inventory_id, item_id)
+                )
+                if existing_item:
+                    qty_col = 'quantiter' if 'quantiter' in existing_item else 'quantity'
+                    await tx.execute(
+                        f"UPDATE {inventory_table} SET {qty_col} = {qty_col} + %s WHERE inventory_id = %s AND {item_id_column} = %s",
+                        (quantity, inventory_id, item_id)
+                    )
+                else:
+                    try:
+                        await tx.execute(
+                            f"INSERT INTO {inventory_table} (inventory_id, {item_id_column}, quantiter) VALUES (%s, %s, %s)",
+                            (inventory_id, item_id, quantity)
+                        )
+                    except Exception:
+                        await tx.execute(
+                            f"INSERT INTO {inventory_table} (inventory_id, {item_id_column}, quantity) VALUES (%s, %s, %s)",
+                            (inventory_id, item_id, quantity)
+                        )
+
+            quest = await tx.fetchone(
+                """
+                SELECT uq.*, q.quest_name, q.required_count
+                FROM user_quests uq
+                JOIN quest q ON uq.quest_id = q.quest_id
+                WHERE uq.user_id = %s AND q.quest_name = 'Buy 1 shop item' AND uq.completion_status = 0
+                FOR UPDATE
+                """,
+                (user_id,)
+            )
+            if quest:
+                new_count = quest['current_count'] + 1
+                await tx.execute(
+                    """
+                    UPDATE user_quests
+                    SET current_count = %s,
+                        completion_status = CASE WHEN %s >= %s THEN 1 ELSE 0 END
+                    WHERE userquests_id = %s
+                    """,
+                    (new_count, new_count, quest['required_count'], quest['userquests_id'])
+                )
+                if new_count >= quest['required_count']:
+                    chest = await tx.fetchone(
+                        "SELECT quantiter FROM inventory_chest WHERE inventory_id = %s AND chest_id = 1 FOR UPDATE",
+                        (inventory_id,)
+                    )
+                    if chest:
+                        await tx.execute(
+                            "UPDATE inventory_chest SET quantiter = quantiter + 1 WHERE inventory_id = %s AND chest_id = 1",
+                            (inventory_id,)
+                        )
+                    else:
+                        await tx.execute(
+                            "INSERT INTO inventory_chest (inventory_id, chest_id, quantiter) VALUES (%s, 1, 1)",
+                            (inventory_id,)
+                        )
+
+            return new_currency
+
     async def get_category_items(self, category: ItemType):
         if category == ItemType.WEAPON:
             query = """
@@ -1137,6 +1330,7 @@ class ShopCommands(commands.Cog):
 
 
     @commands.command(aliases=['by'])
+    @block_during_user_activity(get_user_multilanguage)
     async def buy(self, ctx, *, args):
         lang = await getlang(ctx.author.id)
 
@@ -1363,8 +1557,14 @@ class ShopCommands(commands.Cog):
                 ))
                 return
 
-            # Insert pending status
-            await execute_query_with_retry("INSERT INTO shop_status (user_id) VALUES (%s)", (user_id,))
+            # Insert pending status atomically.
+            if not await claim_user_status_row("shop_status", user_id):
+                await ctx.send(_tr(lang,
+                    "⚠️ You already have a pending purchase. Please complete or cancel your previous purchase before buying this item again.",
+                    "⚠️ لديك عملية شراء معلّقة بالفعل. يرجى إكمال أو إلغاء العملية السابقة قبل الشراء مرة أخرى.",
+                    "⚠️ Vous avez déjà un achat en attente. Veuillez terminer ou annuler l'achat précédent avant d'acheter à nouveau."
+                ))
+                return
 
             # Build confirmation embed
             embed = discord.Embed(
@@ -1577,6 +1777,41 @@ class ShopCommands(commands.Cog):
                     "Achat annulé."
                 ))
                 return
+
+            currency_column = "candy_currency" if (is_halloween or use_candy) else "won_currency"
+            new_currency = await self._apply_shop_purchase_transaction(
+                user_id, item_type, item_details, quantity, final_price, currency_column
+            )
+
+            success = discord.Embed(
+                title=_tr(lang, "Purchase Successful!", "Purchase Successful!", "Achat reussi !"),
+                color=discord.Color.green()
+            )
+            success.set_author(name=ctx.author.display_name, icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
+            success.add_field(name=_tr(lang, "Item", "Item", "Objet"), value=item_name, inline=True)
+            success.add_field(name=_tr(lang, "Quantity", "Quantity", "Quantite"), value=str(quantity), inline=True)
+
+            if is_halloween or use_candy:
+                success.add_field(name=_tr(lang, "Total Price", "Total Price", "Prix total"), value=f"{final_price:,} <:candy:1426599572012269578>", inline=True)
+                success.add_field(name=_tr(lang, "New Balance", "New Balance", "Nouveau solde"), value=f"{new_currency:,} <:candy:1426599572012269578>", inline=True)
+            else:
+                if item_type == 'weapon' and discount_applied:
+                    success.add_field(
+                        name=_tr(lang, "Total Price", "Total Price", "Prix total"),
+                        value=f"~~{item_details['price'] * quantity:,}~~ {final_price:,} won (Premium Discount Applied)",
+                        inline=True
+                    )
+                else:
+                    success.add_field(name=_tr(lang, "Total Price", "Total Price", "Prix total"), value=f"{final_price:,} won", inline=True)
+                success.add_field(name=_tr(lang, "New Balance", "New Balance", "Nouveau solde"), value=f"{new_currency:,} won", inline=True)
+
+            success.set_footer(text=_tr(lang, "Thank you for your purchase!", "Thank you for your purchase!", "Merci pour votre achat !"))
+
+            if view.interaction:
+                await view.interaction.response.send_message(embed=success)
+            else:
+                await ctx.send(embed=success)
+            return
 
             if is_halloween or use_candy:
                 currency_result = await execute_query_with_retry("SELECT candy_currency FROM user WHERE user_id = %s", (user_id,))
@@ -1818,6 +2053,7 @@ class ShopCommands(commands.Cog):
         except Exception as e:
             await ctx.send(_tr(lang, f"An error occurred: {e}", f"حدث خطأ: {e}", f"Une erreur s'est produite : {e}"))
     @commands.command(name="gbuy", aliases=["gby", "gbu"])
+    @block_during_user_activity(get_user_multilanguage)
     async def gbuy(self, ctx, *, args):
         lang = await getlang(ctx.author.id)
 
@@ -1972,7 +2208,13 @@ class ShopCommands(commands.Cog):
                 ))
                 return
 
-            await execute_query_with_retry("INSERT INTO shop_status (user_id) VALUES (%s)", (user_id,))
+            if not await claim_user_status_row("shop_status", user_id):
+                await ctx.send(_tr(lang,
+                    "⚠️ You already have a pending purchase. Please complete or cancel your previous purchase before buying this item again.",
+                    "⚠️ لديك عملية شراء معلّقة بالفعل. يرجى إكمال أو إلغاء العملية السابقة قبل الشراء مرة أخرى.",
+                    "⚠️ Vous avez déjà un achat en attente. Veuillez terminer ou annuler l'achat précédent avant d'acheter à nouveau."
+                ))
+                return
             await execute_query_with_retry("INSERT INTO gamble_status (user_id) VALUES (%s)", (user_id,))
 
             # Confirmation embed
@@ -2072,6 +2314,27 @@ class ShopCommands(commands.Cog):
             elif not view.value:
                 await ctx.send(_tr(lang, "Purchase cancelled.", "تم إلغاء الشراء.", "Achat annulé."))
                 return
+
+            new_currency = await self._apply_shop_purchase_transaction(
+                user_id, item_type, item_details, quantity, final_price, "gamble_currency"
+            )
+
+            success = discord.Embed(
+                title=_tr(lang, "Purchase Successful! (Gwon)", "Purchase Successful! (GWon)", "Achat reussi ! (Gwon)"),
+                color=discord.Color.green()
+            )
+            success.set_author(name=ctx.author.display_name, icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
+            success.add_field(name=_tr(lang, "Item", "Item", "Objet"), value=item_name, inline=True)
+            success.add_field(name=_tr(lang, "Quantity", "Quantity", "Quantite"), value=str(quantity), inline=True)
+            success.add_field(name=_tr(lang, "Total Price", "Total Price", "Prix total"), value=f"{final_price:,} <:gamble:1314341368176574564>", inline=True)
+            success.add_field(name=_tr(lang, "New Balance", "New Balance", "Nouveau solde"), value=f"{new_currency:,} <:gamble:1314341368176574564>", inline=True)
+            success.set_footer(text=_tr(lang, "Thank you for your purchase!", "Thank you for your purchase!", "Merci pour votre achat !"))
+
+            if view.interaction:
+                await view.interaction.response.send_message(embed=success)
+            else:
+                await ctx.send(embed=success)
+            return
 
             # Charge gwon
             gwon_result = await execute_query_with_retry("SELECT gamble_currency FROM user WHERE user_id = %s", (user_id,))

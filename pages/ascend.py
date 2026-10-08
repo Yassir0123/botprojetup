@@ -4,6 +4,8 @@ import asyncio
 from PIL import Image, ImageDraw, ImageFont
 import random
 from utils.database import execute_query_with_retry
+from utils.activity_state import block_during_user_activity
+from utils.db_atomic import db_advisory_lock, db_transaction
 import io
 import os
 import time
@@ -105,6 +107,7 @@ class AscendCommands(commands.Cog):
                 return {'attack': 0, 'health': 0, 'speed': 0, 'defence': 0}
 
     @commands.command(aliases=["asc"])
+    @block_during_user_activity(_get_lang)
     async def ascend(self, ctx, *, card_name=None):
         lang = await _get_lang(ctx.author.id)
 
@@ -588,64 +591,124 @@ class AscendCommands(commands.Cog):
 
             # User confirmed, proceed with ascension
             try:
-                # 1. Deduct currency
-                update_currency_query = "UPDATE user SET won_currency = won_currency - %s WHERE user_id = %s"
-                await execute_query_with_retry(update_currency_query, (won_currency_cap, user_id))
+                failed_requirements = False
+                async with db_advisory_lock(f"slbot:ascend:{user_id}:{card_id}", timeout=5):
+                    async with db_transaction():
+                        user_rows = await execute_query_with_retry(
+                            "SELECT won_currency FROM user WHERE user_id = %s FOR UPDATE",
+                            (user_id,)
+                        )
+                        card_rows = await execute_query_with_retry(
+                            """
+                            SELECT current_level, affinity, card_rank, evo
+                            FROM user_cards
+                            WHERE user_id = %s AND card_id = %s
+                            FOR UPDATE
+                            """,
+                            (user_id, card_id)
+                        )
+                        frag_result = await execute_query_with_retry(
+                            """
+                            SELECT quantiter
+                            FROM inventory_frags
+                            WHERE inventory_id = %s AND frag_id = %s
+                            FOR UPDATE
+                            """,
+                            (inventory_id, fragment_id)
+                        )
+                        orb_result = await execute_query_with_retry(
+                            """
+                            SELECT quantiter
+                            FROM inventory_orbs
+                            WHERE inventory_id = %s AND orb_id = %s
+                            FOR UPDATE
+                            """,
+                            (inventory_id, dungeonorb_id)
+                        )
 
-                # 2. Update or delete fragment entry
-                get_frags_query = "SELECT quantiter FROM inventory_frags WHERE inventory_id = %s AND frag_id = %s"
-                frag_result = await execute_query_with_retry(get_frags_query, (inventory_id, fragment_id))
-                remaining_frags = frag_result[0]['quantiter'] - fragment_cap
+                        has_requirements = (
+                            user_rows and user_rows[0]['won_currency'] >= won_currency_cap
+                            and card_rows
+                            and card_rows[0]['current_level'] >= level_cap
+                            and card_rows[0]['affinity'] >= affinity_cap
+                            and card_rows[0]['card_rank'] == user_card['card_rank']
+                            and card_rows[0]['evo'] == current_evo
+                            and frag_result and frag_result[0]['quantiter'] >= fragment_cap
+                            and orb_result and orb_result[0]['quantiter'] >= dungeon_orb_cap
+                        )
+                        if not has_requirements:
+                            await execute_query_with_retry("DELETE FROM ascending_state WHERE user_id = %s", (user_id,))
+                            failed_requirements = True
+                        else:
+                            await execute_query_with_retry(
+                                "UPDATE user SET won_currency = won_currency - %s WHERE user_id = %s",
+                                (won_currency_cap, user_id)
+                            )
 
-                if remaining_frags <= 0:
-                    delete_frags_query = "DELETE FROM inventory_frags WHERE inventory_id = %s AND frag_id = %s"
-                    await execute_query_with_retry(delete_frags_query, (inventory_id, fragment_id))
-                    update_frags_querydd = "UPDATE user SET quantiter_fragment = quantiter_fragment - %s WHERE user_id = %s"
-                    await execute_query_with_retry(update_frags_querydd, (fragment_cap, user_id))
-                else:
-                    update_frags_query = "UPDATE inventory_frags SET quantiter = %s WHERE inventory_id = %s AND frag_id = %s"
-                    await execute_query_with_retry(update_frags_query, (remaining_frags, inventory_id, fragment_id))
-                    update_frags_queryd = "UPDATE user SET quantiter_fragment = quantiter_fragment - %s WHERE user_id = %s"
-                    await execute_query_with_retry(update_frags_queryd, (fragment_cap, user_id))
-                # 3. Update or delete orb entry
-                get_orbs_query = "SELECT quantiter FROM inventory_orbs WHERE inventory_id = %s AND orb_id = %s"
-                orb_result = await execute_query_with_retry(get_orbs_query, (inventory_id, dungeonorb_id))
-                remaining_orbs = orb_result[0]['quantiter'] - dungeon_orb_cap
+                            remaining_frags = frag_result[0]['quantiter'] - fragment_cap
+                            if remaining_frags <= 0:
+                                await execute_query_with_retry(
+                                    "DELETE FROM inventory_frags WHERE inventory_id = %s AND frag_id = %s",
+                                    (inventory_id, fragment_id)
+                                )
+                            else:
+                                await execute_query_with_retry(
+                                    "UPDATE inventory_frags SET quantiter = %s WHERE inventory_id = %s AND frag_id = %s",
+                                    (remaining_frags, inventory_id, fragment_id)
+                                )
+                            await execute_query_with_retry(
+                                "UPDATE user SET quantiter_fragment = quantiter_fragment - %s WHERE user_id = %s",
+                                (fragment_cap, user_id)
+                            )
 
-                if remaining_orbs <= 0:
-                    delete_orbs_query = "DELETE FROM inventory_orbs WHERE inventory_id = %s AND orb_id = %s"
-                    await execute_query_with_retry(delete_orbs_query, (inventory_id, dungeonorb_id))
-                else:
-                    update_orbs_query = "UPDATE inventory_orbs SET quantiter = %s WHERE inventory_id = %s AND orb_id = %s"
-                    await execute_query_with_retry(update_orbs_query, (remaining_orbs, inventory_id, dungeonorb_id))
+                            remaining_orbs = orb_result[0]['quantiter'] - dungeon_orb_cap
+                            if remaining_orbs <= 0:
+                                await execute_query_with_retry(
+                                    "DELETE FROM inventory_orbs WHERE inventory_id = %s AND orb_id = %s",
+                                    (inventory_id, dungeonorb_id)
+                                )
+                            else:
+                                await execute_query_with_retry(
+                                    "UPDATE inventory_orbs SET quantiter = %s WHERE inventory_id = %s AND orb_id = %s",
+                                    (remaining_orbs, inventory_id, dungeonorb_id)
+                                )
 
-                current_card_rank = user_card['card_rank']
-                cap_increases = self.calculate_cap_increases(current_card_rank, new_card_rank, current_evo)
-                
-                update_card_query = """
-                UPDATE user_cards 
-                SET  
-                    name = %s, 
-                    image = %s,
-                    evo = evo + 1,
-                    current_xp = 0,
-                    max_leveled = max_leveled + 25,
-                    card_rank = %s,
-                    current_cap_attack = current_cap_attack + %s,
-                    current_cap_health = current_cap_health + %s,
-                    current_cap_speed = current_cap_speed + %s,
-                    current_cap_defence = current_cap_defence + %s
-                WHERE user_id = %s AND card_id = %s
-                """
-                await execute_query_with_retry(update_card_query, (
-                    new_card_name, new_card_image, new_card_rank,
-                    cap_increases['attack'], cap_increases['health'], 
-                    cap_increases['speed'], cap_increases['defence'],
-                    user_id, card_id
-                ))
+                            cap_increases = self.calculate_cap_increases(card_rows[0]['card_rank'], new_card_rank, card_rows[0]['evo'])
+                            await execute_query_with_retry(
+                                """
+                                UPDATE user_cards
+                                SET
+                                    name = %s,
+                                    image = %s,
+                                    evo = evo + 1,
+                                    current_xp = 0,
+                                    max_leveled = max_leveled + 25,
+                                    card_rank = %s,
+                                    current_cap_attack = current_cap_attack + %s,
+                                    current_cap_health = current_cap_health + %s,
+                                    current_cap_speed = current_cap_speed + %s,
+                                    current_cap_defence = current_cap_defence + %s
+                                WHERE user_id = %s AND card_id = %s
+                                """,
+                                (
+                                    new_card_name, new_card_image, new_card_rank,
+                                    cap_increases['attack'], cap_increases['health'],
+                                    cap_increases['speed'], cap_increases['defence'],
+                                    user_id, card_id
+                                )
+                            )
+                            await execute_query_with_retry("DELETE FROM ascending_state WHERE user_id = %s", (user_id,))
 
-                await execute_query_with_retry("DELETE FROM ascending_state WHERE user_id = %s", (user_id,))
+                if failed_requirements:
+                    await message.edit(
+                        content=_tr(lang, "Ascension requirements changed. Please try again.", "Ascension requirements changed. Please try again.", "Ascension requirements changed. Please try again."),
+                        embed=None,
+                        attachments=[],
+                        view=None
+                    )
+                    return
 
+                # Create success embed
                 # Create success embed
                 success_embed = discord.Embed(
                     title=_tr(lang, "Ascension Successful!", "تمت الترقية بنجاح!", "Ascension réussie !"),

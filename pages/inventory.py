@@ -8,6 +8,9 @@ import asyncio
 import time
 import re
 from utils.database import execute_query_with_retry, get_metrics
+from utils.activity_state import block_during_user_activity, claim_user_status_row
+from utils.db_atomic import advisory_lock_for_context, db_transaction, raise_transaction_rollback, transaction_for_context
+from utils.inventory_ops import add_inventory_quantity
 import functools
 async def get_user_multilanguage(user_authorid: int) -> int:
     """
@@ -316,6 +319,101 @@ class InventoryCommands(commands.Cog):
         self.user_cooldowns[cooldown_key] = current_time
         return False, 0
 
+    async def _apply_fragment_sale_transaction(self, user_id, inventory_id, fragments_summary, total_amount):
+        total_fragments_sold = sum(fragment['quantity'] for fragment in fragments_summary)
+
+        async with db_transaction() as tx:
+            await tx.fetchone(
+                "SELECT user_id FROM user WHERE user_id = %s FOR UPDATE",
+                (user_id,)
+            )
+
+            for fragment in fragments_summary:
+                row = await tx.fetchone(
+                    """
+                    SELECT quantiter, locked
+                    FROM inventory_frags
+                    WHERE inventory_id = %s AND frag_id = %s
+                    FOR UPDATE
+                    """,
+                    (inventory_id, fragment['id'])
+                )
+                if not row or row['quantiter'] < fragment['quantity']:
+                    raise RuntimeError(f"You no longer have enough {fragment['name']} to complete this sale.")
+                if row.get('locked') == 1:
+                    raise RuntimeError(f"{fragment['name']} is locked and cannot be sold.")
+
+            for fragment in fragments_summary:
+                row = await tx.fetchone(
+                    """
+                    SELECT quantiter
+                    FROM inventory_frags
+                    WHERE inventory_id = %s AND frag_id = %s
+                    FOR UPDATE
+                    """,
+                    (inventory_id, fragment['id'])
+                )
+                remaining = row['quantiter'] - fragment['quantity']
+                if remaining <= 0:
+                    await tx.execute(
+                        "DELETE FROM inventory_frags WHERE inventory_id = %s AND frag_id = %s",
+                        (inventory_id, fragment['id'])
+                    )
+                else:
+                    await tx.execute(
+                        """
+                        UPDATE inventory_frags
+                        SET quantiter = %s
+                        WHERE inventory_id = %s AND frag_id = %s
+                        """,
+                        (remaining, inventory_id, fragment['id'])
+                    )
+
+            await tx.execute(
+                """
+                UPDATE user
+                SET won_currency = won_currency + %s,
+                    quantiter_fragment = quantiter_fragment - %s
+                WHERE user_id = %s
+                """,
+                (total_amount, total_fragments_sold, user_id)
+            )
+
+            quest = await tx.fetchone(
+                """
+                SELECT uq.userquests_id, uq.current_count, uq.completion_status, q.required_count
+                FROM user_quests uq
+                JOIN quest q ON uq.quest_id = q.quest_id
+                WHERE uq.user_id = %s AND q.quest_name = 'Sacrifice 5 Essence Stones'
+                FOR UPDATE
+                """,
+                (user_id,)
+            )
+            if quest and quest['completion_status'] == 0:
+                new_count = quest['current_count'] + total_fragments_sold
+                if new_count > quest['required_count']:
+                    new_count = quest['required_count']
+                completion_status = 1 if new_count >= quest['required_count'] else 0
+                await tx.execute(
+                    "UPDATE user_quests SET current_count = %s, completion_status = %s WHERE userquests_id = %s",
+                    (new_count, completion_status, quest['userquests_id'])
+                )
+                if completion_status == 1:
+                    chest = await tx.fetchone(
+                        "SELECT quantiter FROM inventory_chest WHERE inventory_id = %s AND chest_id = 1 FOR UPDATE",
+                        (inventory_id,)
+                    )
+                    if chest:
+                        await tx.execute(
+                            "UPDATE inventory_chest SET quantiter = quantiter + 1 WHERE inventory_id = %s AND chest_id = 1",
+                            (inventory_id,)
+                        )
+                    else:
+                        await tx.execute(
+                            "INSERT INTO inventory_chest (inventory_id, chest_id, quantiter) VALUES (%s, 1, 1)",
+                            (inventory_id,)
+                        )
+
     def parse_input(self, input_string):
         pattern = r'\$\$(.*?)\$\$'
         matches = re.findall(pattern, input_string)
@@ -476,15 +574,14 @@ class InventoryCommands(commands.Cog):
                 table_name = "inventory_product"
                 id_column = "product_id"
            
-            # Check if item already exists
-            check_query = f"SELECT quantiter FROM {table_name} WHERE inventory_id = %s AND {id_column} = %s"
+            # Check if item already exists. FOR UPDATE is active when caller is in db_transaction.
+            check_query = f"SELECT quantiter FROM {table_name} WHERE inventory_id = %s AND {id_column} = %s FOR UPDATE"
             check_result = await execute_query_with_retry(check_query, (inventory_id, item_id))
            
             if check_result:
-                # Update existing item
-                new_quantity = check_result[0]['quantiter'] + quantity
-                update_query = f"UPDATE {table_name} SET quantiter = %s WHERE inventory_id = %s AND {id_column} = %s"
-                await execute_query_with_retry(update_query, (new_quantity, inventory_id, item_id))
+                # Update existing item atomically.
+                update_query = f"UPDATE {table_name} SET quantiter = quantiter + %s WHERE inventory_id = %s AND {id_column} = %s"
+                await execute_query_with_retry(update_query, (quantity, inventory_id, item_id))
             else:
                 # Insert new item - handle potential duplicate key errors
                 try:
@@ -520,30 +617,47 @@ class InventoryCommands(commands.Cog):
         If no row exists, insert a new row with quantiter = 1
         """
         try:
-            # First, check if a row exists for this inventory_id and chest_id
-            check_query = """
-            SELECT quantiter FROM inventory_chest
-            WHERE inventory_id = %s AND chest_id = 1
-            """
-            check_result = await execute_query_with_retry(check_query, (inventory_id,))
-           
-            if check_result:
-                # Update existing row, increment quantiter
-                update_query = """
-                UPDATE inventory_chest
-                SET quantiter = quantiter + 1
-                WHERE inventory_id = %s AND chest_id = 1
-                """
-                await execute_query_with_retry(update_query, (inventory_id,))
-            else:
-                # Insert new row
-                insert_query = """
-                INSERT INTO inventory_chest (inventory_id, chest_id, quantiter)
-                VALUES (%s, 1, 1)
-                """
-                await execute_query_with_retry(insert_query, (inventory_id,))
+            await add_inventory_quantity("inventory_chest", inventory_id, 1, 1)
         except Exception as e:
             print(f"Error updating inventory chest: {e}")
+
+    async def _consume_reset_item_and_apply(self, inv_item, reset_type, squad_id, user_id, timer_col, count_col):
+        async with db_transaction():
+            locked_item = await execute_query_with_retry(
+                """
+                SELECT id_ligneinventoryproduct, quantiter
+                FROM inventory_product
+                WHERE id_ligneinventoryproduct = %s
+                FOR UPDATE
+                """,
+                (inv_item['id_ligneinventoryproduct'],)
+            )
+            if not locked_item or locked_item[0]['quantiter'] <= 0:
+                return False
+
+            if locked_item[0]['quantiter'] == 1:
+                await execute_query_with_retry(
+                    "DELETE FROM inventory_product WHERE id_ligneinventoryproduct = %s",
+                    (locked_item[0]['id_ligneinventoryproduct'],)
+                )
+            else:
+                await execute_query_with_retry(
+                    "UPDATE inventory_product SET quantiter = quantiter - 1 WHERE id_ligneinventoryproduct = %s",
+                    (locked_item[0]['id_ligneinventoryproduct'],)
+                )
+
+            if reset_type == 'squad' and squad_id is not None:
+                update_query = f"UPDATE user SET {timer_col} = NULL WHERE squad_id = %s"
+                await execute_query_with_retry(update_query, (squad_id,))
+            else:
+                parts = [f"{timer_col} = NULL"]
+                if count_col:
+                    parts.append(f"{count_col} = 0")
+                await execute_query_with_retry(
+                    f"UPDATE user SET {', '.join(parts)} WHERE user_id = %s",
+                    (user_id,)
+                )
+            return True
 
     async def check_premium_status(self, user_id):
         """Check and update premium status if expired."""
@@ -599,6 +713,7 @@ class InventoryCommands(commands.Cog):
         return tier_names.get(tier, "Unknown")
 
     @commands.command(name="loot", aliases=["lt", "lo"])
+    @advisory_lock_for_context("slbot:inventory")
     async def loot(self, ctx, *args):
         try:
             lang = await get_user_multilanguage(ctx.author.id)
@@ -757,36 +872,12 @@ class InventoryCommands(commands.Cog):
                 ))
                 return
 
-            # Update chest quantity - FIXED: Check if record exists first
-            check_query = "SELECT 1 FROM inventory_chest WHERE inventory_id = %s AND chest_id = %s"
-            await execute_query_with_retry(check_query, (inventory_id, chest_id))
-           
-            new_chest_quantity = available_quantity - quantity
-           
-            if new_chest_quantity == 0:
-                try:
-                    delete_query = "DELETE FROM inventory_chest WHERE inventory_id = %s AND chest_id = %s"
-                    await execute_query_with_retry(delete_query, (inventory_id, chest_id))
-                except Exception as delete_error:
-                    print(f"Error deleting chest: {delete_error}")
-            else:
-                try:
-                    # Try update first
-                    update_query = "UPDATE inventory_chest SET quantiter = %s WHERE inventory_id = %s AND chest_id = %s"
-                    result = await execute_query_with_retry(update_query, (new_chest_quantity, inventory_id, chest_id))
-                   
-                    # If no rows affected, insert new record
-                    if result is None or (hasattr(result, 'rowcount') and result.rowcount == 0):
-                        insert_query = "INSERT INTO inventory_chest (inventory_id, chest_id, quantiter) VALUES (%s, %s, %s)"
-                        await execute_query_with_retry(insert_query, (inventory_id, chest_id, new_chest_quantity))
-                except Exception as chest_error:
-                    print(f"Error updating chest quantity: {chest_error}")
+            money_reward = self.calculate_money_reward(chest_data['money_cap'], quantity, 0)
+            gamble_reward = self.calculate_money_reward(chest_data['money_cap'], quantity, 1)
+            reward_plan = []
 
-            # Process rewards based on chest/bag type
-            rewards = []
             if chest_id in [4, 5, 6]:  # Bags with fixed rewards
-                fixed_rewards = self.get_fixed_bag_rewards(chest_id, quantity)  # Pass quantity here
-                rewards = await self.process_fixed_rewards(inventory_id, fixed_rewards)
+                reward_plan = self.get_fixed_bag_rewards(chest_id, quantity)  # Pass quantity here
             else:  # Regular chests with random rewards
                 # Get all available items
                 available_items = await self.get_available_items(chest_id)
@@ -831,23 +922,31 @@ class InventoryCommands(commands.Cog):
                     )
                     reward_quantity = random.randint(min_qty, max_qty)
                    
-                    await self.update_inventory_item(
-                        inventory_id,
-                        item['item_id'],
-                        reward_quantity,
-                        is_dungeon_key=(item['item_type'] == 'dungeonkey')
-                    )
-                   
-                    rewards.append({
+                    reward_plan.append({
+                        'type': item['item_type'],
+                        'id': item['item_id'],
                         'name': item['item_name'],
                         'quantity': reward_quantity,
                         'icon': item['item_icon']
                     })
 
-            # Calculate and update currency reward
-            money_reward = self.calculate_money_reward(chest_data['money_cap'], quantity, 0)
-            gamble_reward = self.calculate_money_reward(chest_data['money_cap'], quantity, 1)
-            await self.update_user_currency(user_id, money_reward, gamble_reward)
+            rewards = await self._apply_loot_transaction(
+                user_id,
+                inventory_id,
+                chest_id,
+                quantity,
+                reward_plan,
+                money_reward,
+                gamble_reward
+            )
+            if rewards is None:
+                await ctx.send(_tr(
+                    lang,
+                    "You don't have enough chests/bags.",
+                    "You don't have enough chests/bags.",
+                    "Vous n'avez pas assez de coffres/sacs."
+                ))
+                return
 
             # Get chest/bag image path
             chest_image = None
@@ -905,17 +1004,11 @@ class InventoryCommands(commands.Cog):
                 icon_url=ctx.author.avatar.url if ctx.author.avatar else None
             )
 
-            # Send embed and update quest progress
+            # Send embed after the DB transaction has already committed.
             if file:
                 await ctx.send(file=file, embed=embed)
             else:
                 await ctx.send(embed=embed)
-               
-            try:
-                # Keep quest name literal to match DB entry
-                await self.update_quest_progress(ctx, user_id, "Open 5 chests", quantity)
-            except Exception as e:
-                print(f"Error in quest tracking: {e}")
 
         except Exception as e:
             await ctx.send(_tr(
@@ -1025,6 +1118,128 @@ class InventoryCommands(commands.Cog):
        
         return processed_rewards
 
+    async def _apply_loot_transaction(self, user_id, inventory_id, chest_id, quantity, reward_plan, money_reward, gamble_reward):
+        processed_rewards = []
+
+        async with db_transaction() as tx:
+            locked_chest = await tx.fetchone(
+                """
+                SELECT quantiter
+                FROM inventory_chest
+                WHERE inventory_id = %s AND chest_id = %s
+                FOR UPDATE
+                """,
+                (inventory_id, chest_id)
+            )
+            if not locked_chest or locked_chest['quantiter'] < quantity:
+                return None
+
+            new_chest_quantity = locked_chest['quantiter'] - quantity
+            if new_chest_quantity == 0:
+                await tx.execute(
+                    "DELETE FROM inventory_chest WHERE inventory_id = %s AND chest_id = %s",
+                    (inventory_id, chest_id)
+                )
+            else:
+                await tx.execute(
+                    "UPDATE inventory_chest SET quantiter = %s WHERE inventory_id = %s AND chest_id = %s",
+                    (new_chest_quantity, inventory_id, chest_id)
+                )
+
+            for reward in reward_plan:
+                is_dungeon_key = reward['type'] == 'dungeonkey'
+                table_name = "inventory_dungeonkey" if is_dungeon_key else "inventory_product"
+                id_column = "dungeonkey_id" if is_dungeon_key else "product_id"
+                item_id = reward['id']
+                reward_quantity = reward['quantity']
+
+                existing = await tx.fetchone(
+                    f"SELECT quantiter FROM {table_name} WHERE inventory_id = %s AND {id_column} = %s FOR UPDATE",
+                    (inventory_id, item_id)
+                )
+                if existing:
+                    await tx.execute(
+                        f"UPDATE {table_name} SET quantiter = quantiter + %s WHERE inventory_id = %s AND {id_column} = %s",
+                        (reward_quantity, inventory_id, item_id)
+                    )
+                else:
+                    await tx.execute(
+                        f"INSERT INTO {table_name} (inventory_id, {id_column}, quantiter) VALUES (%s, %s, %s)",
+                        (inventory_id, item_id, reward_quantity)
+                    )
+
+                name = reward.get('name')
+                icon = reward.get('icon')
+                if not name or not icon:
+                    if is_dungeon_key:
+                        item_result = await tx.fetchone(
+                            "SELECT dungeonkey_name as name, dungeonkey_icon as icon FROM dungeon_key WHERE dungeonkey_id = %s",
+                            (item_id,)
+                        )
+                    else:
+                        item_result = await tx.fetchone(
+                            "SELECT product_name as name, product_icon as icon FROM product WHERE product_id = %s",
+                            (item_id,)
+                        )
+                    if item_result:
+                        name = item_result['name']
+                        icon = item_result['icon']
+
+                if name and icon:
+                    processed_rewards.append({
+                        'name': name,
+                        'quantity': reward_quantity,
+                        'icon': icon
+                    })
+
+            await tx.execute(
+                """
+                UPDATE user
+                SET won_currency = won_currency + %s, gamble_currency = gamble_currency + %s
+                WHERE user_id = %s
+                """,
+                (money_reward, gamble_reward, user_id)
+            )
+
+            quest = await tx.fetchone(
+                """
+                SELECT uq.userquests_id, uq.current_count, uq.completion_status, q.required_count
+                FROM user_quests uq
+                JOIN quest q ON uq.quest_id = q.quest_id
+                WHERE uq.user_id = %s AND q.quest_name = %s
+                FOR UPDATE
+                """,
+                (user_id, "Open 5 chests")
+            )
+            if quest and quest['completion_status'] == 0:
+                increment = min(quantity, quest['required_count'] - quest['current_count'])
+                new_count = quest['current_count'] + increment
+                await tx.execute(
+                    "UPDATE user_quests SET current_count = %s WHERE userquests_id = %s",
+                    (new_count, quest['userquests_id'])
+                )
+                if new_count >= quest['required_count']:
+                    await tx.execute(
+                        "UPDATE user_quests SET completion_status = 1, current_count = %s WHERE userquests_id = %s",
+                        (quest['required_count'], quest['userquests_id'])
+                    )
+                    chest = await tx.fetchone(
+                        "SELECT quantiter FROM inventory_chest WHERE inventory_id = %s AND chest_id = 1 FOR UPDATE",
+                        (inventory_id,)
+                    )
+                    if chest:
+                        await tx.execute(
+                            "UPDATE inventory_chest SET quantiter = quantiter + 1 WHERE inventory_id = %s AND chest_id = 1",
+                            (inventory_id,)
+                        )
+                    else:
+                        await tx.execute(
+                            "INSERT INTO inventory_chest (inventory_id, chest_id, quantiter) VALUES (%s, 1, 1)",
+                            (inventory_id,)
+                        )
+
+        return processed_rewards
+
     async def update_quest_progress(self, ctx, user_id, quest_name, quantity):
         """Track progress for chest opening quests."""
         try:
@@ -1076,6 +1291,7 @@ class InventoryCommands(commands.Cog):
             raise e
 
     @commands.command(name='mine', aliases=['mn', 'mining'])
+    @advisory_lock_for_context("slbot:inventory")
     async def mine_command(self, ctx):
         try:
             lang = await get_user_multilanguage(ctx.author.id)
@@ -1171,6 +1387,7 @@ class InventoryCommands(commands.Cog):
 
 
     @commands.command(name="skip_dungeon", aliases=["sd","skd"])
+    @advisory_lock_for_context("slbot:inventory")
     async def skip_dungeon(self, ctx):
         try:
             lang = await get_user_multilanguage(ctx.author.id)
@@ -1236,32 +1453,65 @@ class InventoryCommands(commands.Cog):
                 ))
                 return
        
-            # Update user's dungeon_skip to 1 and dungeon_round to 2
-            update_user_query = """
-            UPDATE user
-            SET dungeon_skip = 1, dungeon_rounds = 2
-            WHERE user_id = %s
-            """
-            await execute_query_with_retry(update_user_query, (user_id,))
-       
-            # Handle evasion pass quantity in inventory
-            current_quantity = evasion_pass_result[0]['quantiter']
-       
-            if current_quantity == 1:
-                # Delete the row if quantity is 1
-                delete_query = """
-                DELETE FROM inventory_product
-                WHERE inventory_id = %s AND product_id = 19
+            async with db_transaction():
+                locked_user_query = """
+                SELECT dungeon_skip
+                FROM user
+                WHERE user_id = %s
+                FOR UPDATE
                 """
-                await execute_query_with_retry(delete_query, (inventory_id,))
-            else:
-                # Decrease quantity by 1
-                update_quantity_query = """
-                UPDATE inventory_product
-                SET quantiter = quantiter - 1
+                locked_user = await execute_query_with_retry(locked_user_query, (user_id,))
+                if not locked_user:
+                    await ctx.send(_tr(
+                        lang,
+                        "❌ Unable to retrieve dungeon status.",
+                        "❌ Unable to retrieve dungeon status.",
+                        "❌ Unable to retrieve dungeon status."
+                    ))
+                    return
+
+                if locked_user[0]['dungeon_skip'] == 1:
+                    await ctx.send(_tr(
+                        lang,
+                        "⚠️ You already have an evasion pass active!",
+                        "⚠️ You already have an evasion pass active!",
+                        "⚠️ You already have an evasion pass active!"
+                    ))
+                    return
+
+                locked_pass_query = """
+                SELECT id_ligneinventoryproduct, quantiter
+                FROM inventory_product
                 WHERE inventory_id = %s AND product_id = 19
+                FOR UPDATE
                 """
-                await execute_query_with_retry(update_quantity_query, (inventory_id,))
+                locked_pass = await execute_query_with_retry(locked_pass_query, (inventory_id,))
+                if not locked_pass or locked_pass[0]['quantiter'] <= 0:
+                    await ctx.send(_tr(
+                        lang,
+                        "❌ You don't have any Evasion Pass in your inventory.",
+                        "❌ You don't have any Evasion Pass in your inventory.",
+                        "❌ You don't have any Evasion Pass in your inventory."
+                    ))
+                    return
+
+                update_user_query = """
+                UPDATE user
+                SET dungeon_skip = 1, dungeon_rounds = 2
+                WHERE user_id = %s
+                """
+                await execute_query_with_retry(update_user_query, (user_id,))
+
+                if locked_pass[0]['quantiter'] == 1:
+                    delete_query = "DELETE FROM inventory_product WHERE id_ligneinventoryproduct = %s"
+                    await execute_query_with_retry(delete_query, (locked_pass[0]['id_ligneinventoryproduct'],))
+                else:
+                    update_quantity_query = """
+                    UPDATE inventory_product
+                    SET quantiter = quantiter - 1
+                    WHERE id_ligneinventoryproduct = %s AND quantiter > 0
+                    """
+                    await execute_query_with_retry(update_quantity_query, (locked_pass[0]['id_ligneinventoryproduct'],))
        
             # Success message
             embed = discord.Embed(
@@ -1301,7 +1551,79 @@ class InventoryCommands(commands.Cog):
             ))
 
 
+    async def _equip_pickaxe_locked(self, user_id, inventory_id, pickaxe_id):
+        """Atomically return the old pickaxe, consume the new one, and equip it."""
+        async with db_transaction():
+            locked_user_query = "SELECT pickaxe_id FROM user WHERE user_id = %s FOR UPDATE"
+            locked_user = await execute_query_with_retry(locked_user_query, (user_id,))
+            if not locked_user:
+                return False
+
+            current_pickaxe_id = locked_user[0]['pickaxe_id'] or 0
+
+            locked_new_query = """
+            SELECT quantiter
+            FROM inventory_pickaxe
+            WHERE inventory_id = %s AND id_pickaxe = %s
+            FOR UPDATE
+            """
+            new_pickaxe_inventory = await execute_query_with_retry(locked_new_query, (inventory_id, pickaxe_id))
+            if not new_pickaxe_inventory or new_pickaxe_inventory[0]['quantiter'] <= 0:
+                await execute_query_with_retry("DELETE FROM pickaxe_status WHERE user_id = %s", (user_id,))
+                return False
+
+            if current_pickaxe_id != 0 and current_pickaxe_id != pickaxe_id:
+                locked_current_query = """
+                SELECT quantiter
+                FROM inventory_pickaxe
+                WHERE inventory_id = %s AND id_pickaxe = %s
+                FOR UPDATE
+                """
+                current_pickaxe_inventory = await execute_query_with_retry(
+                    locked_current_query,
+                    (inventory_id, current_pickaxe_id)
+                )
+                if current_pickaxe_inventory:
+                    await execute_query_with_retry(
+                        """
+                        UPDATE inventory_pickaxe
+                        SET quantiter = quantiter + 1
+                        WHERE inventory_id = %s AND id_pickaxe = %s
+                        """,
+                        (inventory_id, current_pickaxe_id)
+                    )
+                else:
+                    await execute_query_with_retry(
+                        "INSERT INTO inventory_pickaxe(inventory_id, id_pickaxe, quantiter) VALUES(%s, %s, 1)",
+                        (inventory_id, current_pickaxe_id)
+                    )
+
+            if current_pickaxe_id != pickaxe_id:
+                if new_pickaxe_inventory[0]['quantiter'] == 1:
+                    await execute_query_with_retry(
+                        "DELETE FROM inventory_pickaxe WHERE inventory_id = %s AND id_pickaxe = %s",
+                        (inventory_id, pickaxe_id)
+                    )
+                else:
+                    await execute_query_with_retry(
+                        """
+                        UPDATE inventory_pickaxe
+                        SET quantiter = quantiter - 1
+                        WHERE inventory_id = %s AND id_pickaxe = %s AND quantiter > 0
+                        """,
+                        (inventory_id, pickaxe_id)
+                    )
+
+            await execute_query_with_retry(
+                "UPDATE user SET pickaxe_id = %s WHERE user_id = %s",
+                (pickaxe_id, user_id)
+            )
+            await execute_query_with_retry("DELETE FROM pickaxe_status WHERE user_id = %s", (user_id,))
+            return True
+
+
     @commands.command(name='pickadd', aliases=['pa', 'pc'])
+    @advisory_lock_for_context("slbot:inventory")
     async def pickadd_command(self, ctx, *, pickaxe_name: str):
         try:
             lang = await get_user_multilanguage(ctx.author.id)
@@ -1504,94 +1826,28 @@ class InventoryCommands(commands.Cog):
                     await ctx.send(_tr(lang, "Pickaxe replacement timed out.", "انتهى وقت استبدال المعول.", "Le remplacement de la pioche a expiré."))
                     return
 
-            # Handle current equipped pickaxe
-            current_pickaxe_id = user['pickaxe_id']
-       
-            if current_pickaxe_id != 0:
-                # Check quantity of current pickaxe in inventory
-                current_pickaxe_inventory_query = """
-                SELECT * FROM inventory_pickaxe
-                WHERE inventory_id = %s AND id_pickaxe = %s
-                """
-                current_pickaxe_inventory = await execute_query_with_retry(current_pickaxe_inventory_query, (inventory_id, current_pickaxe_id))
-
-                if current_pickaxe_inventory:
-                    # increase quantity
-                    update_current_pickaxe_query = """
-                    UPDATE inventory_pickaxe
-                    SET quantiter = quantiter + 1
-                    WHERE inventory_id = %s AND id_pickaxe = %s
-                    """
-                    await execute_query_with_retry(update_current_pickaxe_query, (inventory_id, current_pickaxe_id))
-                else:
-                    update_current_pickaxe_query = """
-                    INSERT into inventory_pickaxe(inventory_id, id_pickaxe, quantiter) values(%s,%s,1)
-                    """
-                    await execute_query_with_retry(update_current_pickaxe_query, (inventory_id, current_pickaxe_id))                    
-       
-            # Check if user still has the pickaxe in inventory
-            inventory_pickaxe_result = await execute_query_with_retry(inventory_pickaxe_query, (inventory_id, pickaxe_id))
-            if not inventory_pickaxe_result:
-                # Clean up status entry if pickaxe not in inventory
-                delete_status_query = "DELETE FROM pickaxe_status WHERE user_id = %s"
-                await execute_query_with_retry(delete_status_query, (user_id,))
+            equipped = await self._equip_pickaxe_locked(user_id, inventory_id, pickaxe_id)
+            if not equipped:
                 await ctx.send(_tr(
                     lang,
                     f"You no longer have the {pickaxe['pickaxe_name']} pickaxe in your inventory.",
-                    f"لم يعد لديك معول {pickaxe['pickaxe_name']} في جردك.",
-                    f"Vous n'avez plus la pioche {pickaxe['pickaxe_name']} dans votre inventaire."
+                    f"You no longer have the {pickaxe['pickaxe_name']} pickaxe in your inventory.",
+                    f"You no longer have the {pickaxe['pickaxe_name']} pickaxe in your inventory."
                 ))
                 return
-       
-            # Handle new pickaxe
-            new_pickaxe_inventory_query = """
-            SELECT * FROM inventory_pickaxe
-            WHERE inventory_id = %s AND id_pickaxe = %s
-            """
-            new_pickaxe_inventory = await execute_query_with_retry(new_pickaxe_inventory_query, (inventory_id, pickaxe_id))
 
-            if new_pickaxe_inventory:
-                if new_pickaxe_inventory[0]['quantiter'] == 1:
-                    # Remove row if quantity is 1
-                    remove_new_pickaxe_query = """
-                    DELETE FROM inventory_pickaxe
-                    WHERE inventory_id = %s AND id_pickaxe = %s
-                    """
-                    await execute_query_with_retry(remove_new_pickaxe_query, (inventory_id, pickaxe_id))
-                else:
-                    # Decrease quantity
-                    update_new_pickaxe_query = """
-                    UPDATE inventory_pickaxe
-                    SET quantiter = quantiter - 1
-                    WHERE inventory_id = %s AND id_pickaxe = %s
-                    """
-                    await execute_query_with_retry(update_new_pickaxe_query, (inventory_id, pickaxe_id))
-
-            # Update user's equipped pickaxe
-            update_user_pickaxe_query = """
-            UPDATE user
-            SET pickaxe_id = %s
-            WHERE user_id = %s
-            """
-            await execute_query_with_retry(update_user_pickaxe_query, (pickaxe_id, user_id))
-
-            # Create embed with pickaxe equip result
             embed = discord.Embed(
-                title=_tr(lang, "Pickaxe Equipped", "تم تجهيز المعول", "Pioche équipée"),
+                title=_tr(lang, "Pickaxe Equipped", "Pickaxe Equipped", "Pickaxe Equipped"),
                 color=discord.Color.green()
             )
             embed.description = _tr(
                 lang,
                 f"You have successfully equipped the **{pickaxe['pickaxe_name']}** {pickaxe['pickaxe_icon']}!",
-                f"لقد قمت بتجهيز **{pickaxe['pickaxe_name']}** {pickaxe['pickaxe_icon']} بنجاح!",
-                f"Vous avez équipé **{pickaxe['pickaxe_name']}** {pickaxe['pickaxe_icon']} avec succès !"
+                f"You have successfully equipped the **{pickaxe['pickaxe_name']}** {pickaxe['pickaxe_icon']}!",
+                f"You have successfully equipped the **{pickaxe['pickaxe_name']}** {pickaxe['pickaxe_icon']}!"
             )
-       
-            # Delete user from pickaxe_status table after successful operation
-            delete_status_query = "DELETE FROM pickaxe_status WHERE user_id = %s"
-            await execute_query_with_retry(delete_status_query, (user_id,))
-       
             await ctx.send(embed=embed)
+            return
 
         except Exception as e:
             # Make sure to clean up status entry if there's an error
@@ -1611,6 +1867,9 @@ class InventoryCommands(commands.Cog):
                 "Une erreur est survenue lors de l'ajout de la pioche."
             ))
     @commands.command(name='hxpboost', aliases=["hxb", "hxp"])
+    @advisory_lock_for_context("slbot:inventory")
+    @block_during_user_activity(get_user_multilanguage)
+    @transaction_for_context()
     async def hxp_boost(self, ctx, *, args):
         lang = await get_user_multilanguage(ctx.author.id)
         print("mjnon")
@@ -1694,7 +1953,12 @@ class InventoryCommands(commands.Cog):
             inventory_id = inventory_result[0]['inventory_id']
 
             # Check product availability
-            inv_product_query = "SELECT * FROM inventory_product WHERE inventory_id = %s AND product_id = %s"
+            inv_product_query = """
+            SELECT *
+            FROM inventory_product
+            WHERE inventory_id = %s AND product_id = %s
+            FOR UPDATE
+            """
             inv_product_result = await execute_query_with_retry(inv_product_query, (inventory_id, product_id))
             if not inv_product_result:
                 await ctx.send(_tr(
@@ -1753,6 +2017,23 @@ class InventoryCommands(commands.Cog):
 
             # Exactly one card
             user_card = user_card_result[0]
+            locked_card_query = """
+            SELECT u.*, c.type_card, c.xp_cap, c.card_icon
+            FROM user_cards u
+            JOIN card c ON u.card_id = c.card_id
+            WHERE u.id_ligneusercards = %s
+            FOR UPDATE
+            """
+            locked_card_result = await execute_query_with_retry(locked_card_query, (user_card['id_ligneusercards'],))
+            if not locked_card_result:
+                await ctx.send(_tr(
+                    lang,
+                    "This card could not be locked for XP boost. Please try again.",
+                    "This card could not be locked for XP boost. Please try again.",
+                    "Cette carte n'a pas pu etre verrouillee pour le boost XP. Veuillez reessayer."
+                ))
+                return
+            user_card = locked_card_result[0]
 
             # Type check
             if user_card['type_card'] in ['Support', 'Booster']:
@@ -2092,9 +2373,9 @@ class InventoryCommands(commands.Cog):
                 update_quantity_query = """
                 UPDATE inventory_product
                 SET quantiter = quantiter - %s
-                WHERE inventory_id = %s AND product_id = %s
+                WHERE inventory_id = %s AND product_id = %s AND quantiter >= %s
                 """
-                await execute_query_with_retry(update_quantity_query, (boosts_to_use, inventory_id, product_id))
+                await execute_query_with_retry(update_quantity_query, (boosts_to_use, inventory_id, product_id, boosts_to_use))
 
             # Get updated stats for message
             updated_stats_query = """
@@ -2160,7 +2441,11 @@ class InventoryCommands(commands.Cog):
                 f"حدث خطأ: {str(e)}",
                 f"Une erreur s'est produite : {str(e)}"
             ))
+            raise_transaction_rollback()
     @commands.command(name='xpboost', aliases=["xb", "xp"])
+    @advisory_lock_for_context("slbot:inventory")
+    @block_during_user_activity(get_user_multilanguage)
+    @transaction_for_context()
     async def xp_boost(self, ctx, *, args):
         lang = await get_user_multilanguage(ctx.author.id)
 
@@ -2244,7 +2529,12 @@ class InventoryCommands(commands.Cog):
             inventory_id = inventory_result[0]['inventory_id']
 
             # Check product availability
-            inv_product_query = "SELECT * FROM inventory_product WHERE inventory_id = %s AND product_id = %s"
+            inv_product_query = """
+            SELECT *
+            FROM inventory_product
+            WHERE inventory_id = %s AND product_id = %s
+            FOR UPDATE
+            """
             inv_product_result = await execute_query_with_retry(inv_product_query, (inventory_id, product_id))
             if not inv_product_result:
                 await ctx.send(_tr(
@@ -2303,6 +2593,23 @@ class InventoryCommands(commands.Cog):
 
             # Exactly one card
             user_card = user_card_result[0]
+            locked_card_query = """
+            SELECT u.*, c.type_card, c.xp_cap, c.card_icon
+            FROM user_cards u
+            JOIN card c ON u.card_id = c.card_id
+            WHERE u.id_ligneusercards = %s
+            FOR UPDATE
+            """
+            locked_card_result = await execute_query_with_retry(locked_card_query, (user_card['id_ligneusercards'],))
+            if not locked_card_result:
+                await ctx.send(_tr(
+                    lang,
+                    "This card could not be locked for XP boost. Please try again.",
+                    "This card could not be locked for XP boost. Please try again.",
+                    "Cette carte n'a pas pu etre verrouillee pour le boost XP. Veuillez reessayer."
+                ))
+                return
+            user_card = locked_card_result[0]
 
             # Type check
             if user_card['type_card'] in ['Support', 'Booster']:
@@ -2642,9 +2949,9 @@ class InventoryCommands(commands.Cog):
                 update_quantity_query = """
                 UPDATE inventory_product
                 SET quantiter = quantiter - %s
-                WHERE inventory_id = %s AND product_id = %s
+                WHERE inventory_id = %s AND product_id = %s AND quantiter >= %s
                 """
-                await execute_query_with_retry(update_quantity_query, (boosts_to_use, inventory_id, product_id))
+                await execute_query_with_retry(update_quantity_query, (boosts_to_use, inventory_id, product_id, boosts_to_use))
 
             # Get updated stats for message
             updated_stats_query = """
@@ -2710,6 +3017,7 @@ class InventoryCommands(commands.Cog):
                 f"حدث خطأ: {str(e)}",
                 f"Une erreur s'est produite : {str(e)}"
             ))
+            raise_transaction_rollback()
 
 
     def parsed_input(self, args):
@@ -2720,6 +3028,9 @@ class InventoryCommands(commands.Cog):
         return ' '.join(parts[:-1]), parts[-1]
 
     @commands.command(name="level", aliases=["lv", "lvl"])
+    @advisory_lock_for_context("slbot:inventory")
+    @block_during_user_activity(get_user_multilanguage)
+    @transaction_for_context()
     async def level(self, ctx, *, args):
         lang = await get_user_multilanguage(ctx.author.id)
         try:
@@ -2855,6 +3166,23 @@ class InventoryCommands(commands.Cog):
                 return
 
             user_card = card_result[0]
+            locked_card_query = """
+            SELECT uc.*, c.type_card, uc.max_leveled, c.xp_cap, c.id_fragment, c.card_icon
+            FROM user_cards uc
+            JOIN card c ON uc.card_id = c.card_id
+            WHERE uc.id_ligneusercards = %s
+            FOR UPDATE
+            """
+            locked_card_result = await execute_query_with_retry(locked_card_query, (user_card['id_ligneusercards'],))
+            if not locked_card_result:
+                await ctx.send(_tr(
+                    lang,
+                    "This card could not be locked for leveling. Please try again.",
+                    "This card could not be locked for leveling. Please try again.",
+                    "Cette carte n'a pas pu etre verrouillee pour le niveau. Veuillez reessayer."
+                ))
+                return
+            user_card = locked_card_result[0]
 
             # Card type check
             if user_card['type_card'] in ['Support', 'Booster']:
@@ -2892,6 +3220,7 @@ class InventoryCommands(commands.Cog):
             frag_query = """
             SELECT quantiter FROM inventory_frags
             WHERE inventory_id = %s AND frag_id = %s
+            FOR UPDATE
             """
             frag_result = await execute_query_with_retry(frag_query, (inventory_id, user_card['id_fragment']))
             if not frag_result:
@@ -3211,10 +3540,10 @@ class InventoryCommands(commands.Cog):
                 update_frag_query = """
                 UPDATE inventory_frags
                 SET quantiter = quantiter - %s
-                WHERE inventory_id = %s AND frag_id = %s
+                WHERE inventory_id = %s AND frag_id = %s AND quantiter >= %s
                 """
                 await execute_query_with_retry(update_frag_query, (
-                    fragments_to_use, inventory_id, user_card['id_fragment']
+                    fragments_to_use, inventory_id, user_card['id_fragment'], fragments_to_use
                 ))
 
             update_frags_query = "UPDATE user set quantiter_fragment = quantiter_fragment - %s WHERE user_id = %s"
@@ -3279,6 +3608,7 @@ class InventoryCommands(commands.Cog):
                 "حدث خطأ أثناء معالجة طلبك.",
                 "Une erreur s'est produite lors du traitement de votre demande."
             ))
+            raise_transaction_rollback()
 
 
     # Helper methods needed for the improved commands
@@ -3551,7 +3881,7 @@ class InventoryCommands(commands.Cog):
                 eq_id = equipment['eq_id']
                 halloween_flag = equipment['halloween_flag']
                 halloween_id = equipment['halloween_id']
-                
+
                 if eq_id:
                     # Check if this is a halloween equipment
                     if halloween_flag == 1 and halloween_id:
@@ -3757,6 +4087,8 @@ class InventoryCommands(commands.Cog):
             print(f"Error applying support boosts to single card: {e}")
     @commands.command(name="exchange", aliases=["ex", "exch"])
     @command_cooldown(rate=1, per=3.0, type=commands.BucketType.user)
+    @advisory_lock_for_context("slbot:inventory")
+    @block_during_user_activity(get_user_multilanguage)
     async def exchange(self, ctx, firstcap, secondcap, amount: int = 1):
         lang = await get_user_multilanguage(ctx.author.id)
         try:
@@ -3897,38 +4229,54 @@ class InventoryCommands(commands.Cog):
                 ))
                 return
 
-            # Update firstcap quantity (reduce by required_amount)
-            if firstcap_item['quantiter'] == required_amount:
-                delete_firstcap_query = "DELETE FROM inventory_product WHERE id_ligneinventoryproduct = %s"
-                await execute_query_with_retry(delete_firstcap_query, (firstcap_item['id_ligneinventoryproduct'],))
-            else:
-                update_firstcap_query = "UPDATE inventory_product SET quantiter = quantiter - %s WHERE id_ligneinventoryproduct = %s"
-                await execute_query_with_retry(update_firstcap_query, (required_amount, firstcap_item['id_ligneinventoryproduct']))
+            async with db_transaction():
+                firstcap_lock_query = """
+                SELECT ip.*, p.product_icon, p.product_name
+                FROM inventory_product ip
+                JOIN product p ON ip.product_id = p.product_id
+                WHERE ip.inventory_id = %s AND ip.product_id = %s
+                FOR UPDATE
+                """
+                firstcap_result = await execute_query_with_retry(firstcap_lock_query, (inventory_id, first_product_id))
+                if not firstcap_result or firstcap_result[0]['quantiter'] < required_amount:
+                    await ctx.send(_tr(
+                        lang,
+                        f"You need {required_amount} {firstcap.upper()} to exchange for {amount} {secondcap.upper()}, but you no longer have enough.",
+                        f"You need {required_amount} {firstcap.upper()} to exchange for {amount} {secondcap.upper()}, but you no longer have enough.",
+                        f"You need {required_amount} {firstcap.upper()} to exchange for {amount} {secondcap.upper()}, but you no longer have enough."
+                    ))
+                    return
+                firstcap_item = firstcap_result[0]
 
-            # Check if user already has secondcap in inventory
-            secondcap_query = """
-            SELECT ip.*, p.product_icon, p.product_name
-            FROM inventory_product ip
-            JOIN product p ON ip.product_id = p.product_id
-            WHERE ip.inventory_id = %s AND ip.product_id = %s
-            """
-            secondcap_result = await execute_query_with_retry(secondcap_query, (inventory_id, second_product_id))
+                # Remove the source capsules and add the target capsules together.
+                if firstcap_item['quantiter'] == required_amount:
+                    delete_firstcap_query = "DELETE FROM inventory_product WHERE id_ligneinventoryproduct = %s"
+                    await execute_query_with_retry(delete_firstcap_query, (firstcap_item['id_ligneinventoryproduct'],))
+                else:
+                    update_firstcap_query = "UPDATE inventory_product SET quantiter = quantiter - %s WHERE id_ligneinventoryproduct = %s AND quantiter >= %s"
+                    await execute_query_with_retry(update_firstcap_query, (required_amount, firstcap_item['id_ligneinventoryproduct'], required_amount))
 
-            if secondcap_result:
-                # Update existing secondcap quantity
-                secondcap_item = secondcap_result[0]
-                update_secondcap_query = "UPDATE inventory_product SET quantiter = quantiter + %s WHERE id_ligneinventoryproduct = %s"
-                await execute_query_with_retry(update_secondcap_query, (amount, secondcap_item['id_ligneinventoryproduct']))
-                secondcap_icon = secondcap_item['product_icon']
-            else:
-                # Insert new row for secondcap
-                insert_secondcap_query = "INSERT INTO inventory_product (inventory_id, product_id, quantiter) VALUES (%s, %s, %s)"
-                await execute_query_with_retry(insert_secondcap_query, (inventory_id, second_product_id, amount))
+                secondcap_query = """
+                SELECT ip.*, p.product_icon, p.product_name
+                FROM inventory_product ip
+                JOIN product p ON ip.product_id = p.product_id
+                WHERE ip.inventory_id = %s AND ip.product_id = %s
+                FOR UPDATE
+                """
+                secondcap_result = await execute_query_with_retry(secondcap_query, (inventory_id, second_product_id))
 
-                # Get product icon for response
-                product_query = "SELECT product_icon FROM product WHERE product_id = %s"
-                product_result = await execute_query_with_retry(product_query, (second_product_id,))
-                secondcap_icon = product_result[0]['product_icon'] if product_result else secondcap.upper()
+                if secondcap_result:
+                    secondcap_item = secondcap_result[0]
+                    update_secondcap_query = "UPDATE inventory_product SET quantiter = quantiter + %s WHERE id_ligneinventoryproduct = %s"
+                    await execute_query_with_retry(update_secondcap_query, (amount, secondcap_item['id_ligneinventoryproduct']))
+                    secondcap_icon = secondcap_item['product_icon']
+                else:
+                    insert_secondcap_query = "INSERT INTO inventory_product (inventory_id, product_id, quantiter) VALUES (%s, %s, %s)"
+                    await execute_query_with_retry(insert_secondcap_query, (inventory_id, second_product_id, amount))
+
+                    product_query = "SELECT product_icon FROM product WHERE product_id = %s"
+                    product_result = await execute_query_with_retry(product_query, (second_product_id,))
+                    secondcap_icon = product_result[0]['product_icon'] if product_result else secondcap.upper()
 
             # Create response message
             firstcap_icon = firstcap_item['product_icon']
@@ -3947,6 +4295,9 @@ class InventoryCommands(commands.Cog):
                 f"Une erreur s'est produite : {str(e)}"
             ))
     @commands.command(name="hequip", aliases=["heq", "hep"])
+    @advisory_lock_for_context("slbot:inventory")
+    @block_during_user_activity(get_user_multilanguage)
+    @transaction_for_context()
     async def hequip(self, ctx, *, args):
         lang = await get_user_multilanguage(ctx.author.id)  # 0=en, 1=ar, 2=fr
 
@@ -4083,8 +4434,9 @@ class InventoryCommands(commands.Cog):
             weapon = weapon_result[0]
 
             halloween_weapon_query = """
-            SELECT * FROM weapon_halloween 
+            SELECT * FROM weapon_halloween
             WHERE inventory_id = %s AND weapon_id = %s AND weapon_surname = %s
+            FOR UPDATE
             """
             halloween_weapon_result = await execute_query_with_retry(
                 halloween_weapon_query, 
@@ -4102,7 +4454,7 @@ class InventoryCommands(commands.Cog):
 
             halloween_weapon = halloween_weapon_result[0]
             print(halloween_weapon)
-            if halloween_weapon['quantiter'] == 0:
+            if halloween_weapon['quantiter'] <= 0:
                 await ctx.send(_tr(
                     lang,
                     f"The Halloween weapon '{weapon_name}' is already in use.",
@@ -4258,9 +4610,9 @@ class InventoryCommands(commands.Cog):
                     return
 
             update_halloween_quantity_query = """
-            UPDATE weapon_halloween 
-            SET quantiter = 0 
-            WHERE inventory_id = %s AND weapon_id = %s AND weapon_surname = %s
+            UPDATE weapon_halloween
+            SET quantiter = 0
+            WHERE inventory_id = %s AND weapon_id = %s AND weapon_surname = %s AND quantiter > 0
             """
             await execute_query_with_retry(
                 update_halloween_quantity_query, 
@@ -4288,7 +4640,7 @@ class InventoryCommands(commands.Cog):
                 1: 'id_weaponhalloween',
                 2: 'id_shieldhalloween',
                 3: 'id_armorhalloween'
-                
+
             }.get(weapon['weapon_rank'])
 
             update_equipment_query = f"""
@@ -4316,7 +4668,7 @@ class InventoryCommands(commands.Cog):
                     
                     if halloween_eq_details:
                         return halloween_eq_details[0]
-                
+
                 # Regular weapon or Halloween lookup failed, get from weapon table
                 eq_query = """
                 SELECT attack_boost, health_boost, speed_boost, defense_boost,
@@ -4901,8 +5253,12 @@ class InventoryCommands(commands.Cog):
                 f"حدث خطأ: {str(e)}",
                 f"Une erreur s'est produite : {str(e)}"
             ))
+            raise_transaction_rollback()
 
     @commands.command(name="hunequip", aliases=["hue", "huq"])
+    @advisory_lock_for_context("slbot:inventory")
+    @block_during_user_activity(get_user_multilanguage)
+    @transaction_for_context()
     async def hunequip(self, ctx, *, args):
         lang = await get_user_multilanguage(ctx.author.id)
 
@@ -5118,8 +5474,13 @@ class InventoryCommands(commands.Cog):
                 ))
                 return
 
-            halloween_weapon_query = "SELECT * FROM weapon_halloween WHERE id_weaponhalloween = %s"
-            halloween_weapon_result = await execute_query_with_retry(halloween_weapon_query, (id_weaponhalloween,))
+            halloween_weapon_query = """
+            SELECT *
+            FROM weapon_halloween
+            WHERE id_weaponhalloween = %s AND inventory_id = %s
+            FOR UPDATE
+            """
+            halloween_weapon_result = await execute_query_with_retry(halloween_weapon_query, (id_weaponhalloween, inventory_id))
             if not halloween_weapon_result:
                 await ctx.send(_tr(
                     lang,
@@ -5131,8 +5492,12 @@ class InventoryCommands(commands.Cog):
 
             halloween_weapon = halloween_weapon_result[0]
 
-            update_halloween_weapon_query = "UPDATE weapon_halloween SET quantiter = 1 WHERE id_weaponhalloween = %s"
-            await execute_query_with_retry(update_halloween_weapon_query, (id_weaponhalloween,))
+            update_halloween_weapon_query = """
+            UPDATE weapon_halloween
+            SET quantiter = 1
+            WHERE id_weaponhalloween = %s AND inventory_id = %s
+            """
+            await execute_query_with_retry(update_halloween_weapon_query, (id_weaponhalloween, inventory_id))
 
             flat_attack  = halloween_weapon.get('attack_boost', 0) or 0
             flat_health  = halloween_weapon.get('health_boost', 0) or 0
@@ -5469,8 +5834,12 @@ class InventoryCommands(commands.Cog):
                 f"حدث خطأ: {str(e)}",
                 f"Une erreur s'est produite : {str(e)}"
             ))
+            raise_transaction_rollback()
 
     @commands.command(name="equip", aliases=["eq", "ep"])
+    @advisory_lock_for_context("slbot:inventory")
+    @block_during_user_activity(get_user_multilanguage)
+    @transaction_for_context()
     async def equip(self, ctx, *, args):
         lang = await get_user_multilanguage(ctx.author.id)  # 0=en, 1=ar, 2=fr
 
@@ -5600,12 +5969,25 @@ class InventoryCommands(commands.Cog):
                 return
 
             weapon = weapon_result[0]
+            if weapon.get('halloween') == 1:
+                await ctx.send(_tr(
+                    lang,
+                    "This is a Halloween weapon. Please use the Halloween equip command.",
+                    "هذا سلاح هالوين. يرجى استخدام أمر تجهيز الهالوين.",
+                    "C'est une arme Halloween. Veuillez utiliser la commande d'equipement Halloween."
+                ))
+                return
 
             # Check if user has the weapon
-            inv_weapon_query = "SELECT * FROM inventory_weapon WHERE inventory_id = %s AND weapon_id = %s"
+            inv_weapon_query = """
+            SELECT *
+            FROM inventory_weapon
+            WHERE inventory_id = %s AND weapon_id = %s
+            FOR UPDATE
+            """
             inv_weapon_result = await execute_query_with_retry(inv_weapon_query, (inventory_id, weapon['weapon_id']))
 
-            if not inv_weapon_result:
+            if not inv_weapon_result or inv_weapon_result[0]['quantiter'] <= 0:
                 await ctx.send(_tr(
                     lang,
                     f"You don't have the weapon '{weapon_name}' in your inventory.",
@@ -5765,7 +6147,11 @@ class InventoryCommands(commands.Cog):
                 delete_inv_weapon_query = "DELETE FROM inventory_weapon WHERE inventory_id = %s AND weapon_id = %s"
                 await execute_query_with_retry(delete_inv_weapon_query, (inventory_id, weapon['weapon_id']))
             else:
-                update_inv_weapon_query = "UPDATE inventory_weapon SET quantiter = quantiter - 1 WHERE inventory_id = %s AND weapon_id = %s"
+                update_inv_weapon_query = """
+                UPDATE inventory_weapon
+                SET quantiter = quantiter - 1
+                WHERE inventory_id = %s AND weapon_id = %s AND quantiter > 0
+                """
                 await execute_query_with_retry(update_inv_weapon_query, (inventory_id, weapon['weapon_id']))
 
             # Get weapon boosts for the new weapon
@@ -6356,8 +6742,12 @@ class InventoryCommands(commands.Cog):
                 f"حدث خطأ: {str(e)}",
                 f"Une erreur s'est produite : {str(e)}"
             ))
+            raise_transaction_rollback()
 
     @commands.command(name="unequip", aliases=["ue", "uq"])
+    @advisory_lock_for_context("slbot:inventory")
+    @block_during_user_activity(get_user_multilanguage)
+    @transaction_for_context()
     async def unequip(self, ctx, *, args):
         lang = await get_user_multilanguage(ctx.author.id)  # 0=en, 1=ar, 2=fr
 
@@ -6482,6 +6872,14 @@ class InventoryCommands(commands.Cog):
                 return
 
             weapon = weapon_result[0]
+            if weapon.get('halloween') == 1:
+                await ctx.send(_tr(
+                    lang,
+                    "This is a Halloween weapon. Please use the Halloween unequip command.",
+                    "هذا سلاح هالوين. يرجى استخدام أمر نزع تجهيز الهالوين.",
+                    "C'est une arme Halloween. Veuillez utiliser la commande de desequipement Halloween."
+                ))
+                return
 
             # Check card
             user_card_query = "SELECT * FROM user_cards WHERE user_id = %s AND name LIKE %s"
@@ -6551,6 +6949,11 @@ class InventoryCommands(commands.Cog):
 
             # Check equipped slot
             equipment_column = {1: 'weapon_id', 2: 'shield_id', 3: 'armor_id'}.get(weapon['weapon_rank'])
+            halloween_id_column = {
+                1: 'id_weaponhalloween',
+                2: 'id_shieldhalloween',
+                3: 'id_armorhalloween'
+            }.get(weapon['weapon_rank'])
             if user_card[equipment_column] != weapon['weapon_id']:
                 slot_name = ['weapon', 'shield', 'armor'][weapon['weapon_rank']-1]
                 await ctx.send(_tr(
@@ -6560,16 +6963,17 @@ class InventoryCommands(commands.Cog):
                     f"Cet(te) {slot_name} n’est pas équipé(e) sur cette carte."
                 ))
                 return
+            if user_card.get(halloween_id_column, 0):
+                await ctx.send(_tr(
+                    lang,
+                    "This slot contains Halloween equipment. Please use the Halloween unequip command.",
+                    "هذه الخانة تحتوي على تجهيز هالوين. يرجى استخدام أمر نزع تجهيز الهالوين.",
+                    "Cet emplacement contient un equipement Halloween. Veuillez utiliser la commande de desequipement Halloween."
+                ))
+                return
 
             # Return weapon to inventory
-            inv_weapon_query = "SELECT * FROM inventory_weapon WHERE inventory_id = %s AND weapon_id = %s"
-            inv_weapon_result = await execute_query_with_retry(inv_weapon_query, (inventory_id, weapon['weapon_id']))
-            if not inv_weapon_result:
-                insert_inv_weapon_query = "INSERT INTO inventory_weapon (inventory_id, weapon_id, quantiter) VALUES (%s, %s, 1)"
-                await execute_query_with_retry(insert_inv_weapon_query, (inventory_id, weapon['weapon_id']))
-            else:
-                update_inv_weapon_query = "UPDATE inventory_weapon SET quantiter = quantiter + 1 WHERE inventory_id = %s AND weapon_id = %s"
-                await execute_query_with_retry(update_inv_weapon_query, (inventory_id, weapon['weapon_id']))
+            await add_inventory_quantity("inventory_weapon", inventory_id, weapon['weapon_id'], 1)
 
             # Weapon boosts (to remove)
             flat_attack  = weapon.get('attack_boost', 0) or 0
@@ -6883,8 +7287,12 @@ class InventoryCommands(commands.Cog):
                 f"حدث خطأ: {str(e)}",
                 f"Une erreur s'est produite : {str(e)}"
             ))
+            raise_transaction_rollback()
 
     @commands.command(name="rstat", aliases=["rs", "rts"])
+    @advisory_lock_for_context("slbot:inventory")
+    @block_during_user_activity(get_user_multilanguage)
+    @transaction_for_context()
     async def rstat(self, ctx, *, card_name):
         lang = await get_user_multilanguage(ctx.author.id)  # 0=en, 1=ar, 2=fr
         try:
@@ -6970,6 +7378,23 @@ class InventoryCommands(commands.Cog):
                 return
 
             card = card_result[0]
+            locked_card_query = """
+            SELECT u.*, c.card_icon, c.type_card
+            FROM user_cards u
+            JOIN card c ON u.card_id = c.card_id
+            WHERE u.id_ligneusercards = %s
+            FOR UPDATE
+            """
+            locked_card_result = await execute_query_with_retry(locked_card_query, (card['id_ligneusercards'],))
+            if not locked_card_result:
+                await ctx.send(_tr(
+                    lang,
+                    "This card could not be locked for stat reset. Please try again.",
+                    "This card could not be locked for stat reset. Please try again.",
+                    "Cette carte n'a pas pu etre verrouillee pour la reinitialisation. Veuillez reessayer."
+                ))
+                return
+            card = locked_card_result[0]
 
             if card['type_card'] in ['Support', 'Booster']:
                 await ctx.send(_tr(
@@ -6993,7 +7418,14 @@ class InventoryCommands(commands.Cog):
                 return
 
             # Check reset-stat item (product_id = 3)
-            inventory_query = "SELECT ip.*,p.product_icon FROM inventory i JOIN inventory_product ip ON i.inventory_id = ip.inventory_id JOIN product p ON ip.product_id = ip.product_id WHERE i.user_id = %s AND ip.product_id = 3"
+            inventory_query = """
+            SELECT ip.*, p.product_icon
+            FROM inventory i
+            JOIN inventory_product ip ON i.inventory_id = ip.inventory_id
+            JOIN product p ON ip.product_id = p.product_id
+            WHERE i.user_id = %s AND ip.product_id = 3
+            FOR UPDATE
+            """
             inventory_result = await execute_query_with_retry(inventory_query, (user_id,))
             if not inventory_result:
                 await ctx.send(_tr(
@@ -7003,13 +7435,21 @@ class InventoryCommands(commands.Cog):
                     "Vous n’avez pas d’objet de réinitialisation des stats dans votre inventaire."
                 ))
                 return
+            if inventory_result[0]['quantiter'] <= 0:
+                await ctx.send(_tr(
+                    lang,
+                    "You don't have a reset stat item in your inventory.",
+                    "You don't have a reset stat item in your inventory.",
+                    "Vous n'avez pas d'objet de reinitialisation des stats dans votre inventaire."
+                ))
+                return
 
             # Consume item
             if inventory_result[0]['quantiter'] == 1:
                 delete_query = "DELETE FROM inventory_product WHERE id_ligneinventoryproduct = %s"
                 await execute_query_with_retry(delete_query, (inventory_result[0]['id_ligneinventoryproduct'],))
             else:
-                update_query = "UPDATE inventory_product SET quantiter = quantiter - 1 WHERE id_ligneinventoryproduct = %s"
+                update_query = "UPDATE inventory_product SET quantiter = quantiter - 1 WHERE id_ligneinventoryproduct = %s AND quantiter > 0"
                 await execute_query_with_retry(update_query, (inventory_result[0]['id_ligneinventoryproduct'],))
 
             # Equipment flags
@@ -7275,9 +7715,12 @@ class InventoryCommands(commands.Cog):
                 f"حدث خطأ: {str(e)}",
                 f"Une erreur s'est produite : {str(e)}"
             ))
+            raise_transaction_rollback()
 
 
     @commands.command(name="reset", aliases=["rst", "rt"])
+    @advisory_lock_for_context("slbot:inventory")
+    @block_during_user_activity(get_user_multilanguage)
     async def reset(self, ctx, reset_type: str):
         lang = await get_user_multilanguage(ctx.author.id)  # 0=en, 1=ar, 2=fr
         try:
@@ -7397,36 +7840,26 @@ class InventoryCommands(commands.Cog):
                 ))
                 return
 
-            # Consume item
-            if inv_item_result[0]['quantiter'] == 1:
-                await execute_query_with_retry(
-                    "DELETE FROM inventory_product WHERE id_ligneinventoryproduct = %s",
-                    (inv_item_result[0]['id_ligneinventoryproduct'],)
-                )
-            else:
-                await execute_query_with_retry(
-                    "UPDATE inventory_product SET quantiter = quantiter - 1 WHERE id_ligneinventoryproduct = %s",
-                    (inv_item_result[0]['id_ligneinventoryproduct'],)
-                )
-
             # Apply reset
             count_col = reset_types[reset_type]['count_column']
+            reset_applied = await self._consume_reset_item_and_apply(
+                inv_item_result[0], reset_type, squad_id, user_id, timer_col, count_col
+            )
+            if not reset_applied:
+                display_name = {'rt':'rolls', 'dg':'dungeon', 'ms':'mission', 'f':'fight'}.get(reset_type, reset_type)
+                await ctx.send(_tr(
+                    lang,
+                    f"Your {display_name} reset item is no longer available.",
+                    f"عنصر إعادة ضبط {display_name} لم يعد متاحًا.",
+                    f"Votre objet de réinitialisation {display_name} n'est plus disponible."
+                ))
+                return
             if reset_type == 'squad' and squad_id is not None:
-                update_query = f"UPDATE user SET {timer_col} = NULL WHERE squad_id = %s"
-                await execute_query_with_retry(update_query, (squad_id,))
                 message_en = "Successfully reset the squad timer for all squad members."
                 message_ar = "تمت إعادة ضبط مؤقّت الفرقة لجميع الأعضاء بنجاح."
                 message_fr = "Minuterie d’escouade réinitialisée avec succès pour tous les membres."
                 await ctx.send(_tr(lang, message_en, message_ar, message_fr))
             else:
-                parts = [f"{timer_col} = NULL"]
-                if count_col:
-                    parts.append(f"{count_col} = 0")
-                await execute_query_with_retry(
-                    f"UPDATE user SET {', '.join(parts)} WHERE user_id = %s",
-                    (user_id,)
-                )
-
                 display_name = {'rt':'rolls', 'dg':'dungeon', 'ms':'mission', 'f':'fight'}.get(reset_type, reset_type)
                 tail_en = " and count" if count_col else ""
                 tail_ar = " والعدّاد" if count_col else ""
@@ -7446,6 +7879,8 @@ class InventoryCommands(commands.Cog):
                 f"Une erreur s'est produite : {str(e)}"
             ))
     @commands.command(name="hcharm", aliases=["hchm", "hchr"])
+    @advisory_lock_for_context("slbot:inventory")
+    @block_during_user_activity(get_user_multilanguage)
     async def hcharm(self, ctx, charm_type: str, *, card_name: str):
         lang = await get_user_multilanguage(ctx.author.id)  # 0=en, 1=ar, 2=fr
         try:
@@ -7580,7 +8015,7 @@ class InventoryCommands(commands.Cog):
             WHERE i.user_id = %s AND ip.product_id = %s
             """
             inventory_result = await execute_query_with_retry(inventory_query, (user_id, charm_data['product_id']))
-            if not inventory_result:
+            if not inventory_result or inventory_result[0]['quantiter'] <= 0:
                 await ctx.send(_tr(
                     lang,
                     f"You don't have a {charm_type} charm in your inventory.",
@@ -7589,30 +8024,80 @@ class InventoryCommands(commands.Cog):
                 ))
                 return
 
-            # Consume one
-            if inventory_result[0]['quantiter'] == 1:
-                await execute_query_with_retry(
-                    "DELETE FROM inventory_product WHERE id_ligneinventoryproduct = %s",
-                    (inventory_result[0]['id_ligneinventoryproduct'],)
+            async with db_transaction():
+                locked_card_query = """
+                SELECT u.*, c.card_icon, c.type_card
+                FROM user_cards u
+                JOIN card c ON u.card_id = c.card_id
+                WHERE u.id_ligneusercards = %s
+                FOR UPDATE
+                """
+                locked_card_result = await execute_query_with_retry(
+                    locked_card_query,
+                    (card['id_ligneusercards'],)
                 )
-            else:
-                await execute_query_with_retry(
-                    "UPDATE inventory_product SET quantiter = quantiter - 1 WHERE id_ligneinventoryproduct = %s",
-                    (inventory_result[0]['id_ligneinventoryproduct'],)
-                )
+                if not locked_card_result:
+                    await ctx.send(_tr(
+                        lang,
+                        "You don't have a card with the name you specified.",
+                        "You don't have a card with the name you specified.",
+                        "You don't have a card with the name you specified."
+                    ))
+                    return
 
-            # Apply charm: set the charm column to the product_id and increment count
-            update_query = f"""
-            UPDATE user_cards
-            SET
-                {charm_data['charm_column']} = %s,
-                {charm_data['count_column']} = {charm_data['count_column']} + %s
-            WHERE user_id = %s AND name = %s
-            """
-            await execute_query_with_retry(
-                update_query,
-                (charm_data['product_id'], charm_count, user_id, card['name'])
-            )
+                card = locked_card_result[0]
+                if card[charm_data['charm_column']] != 0:
+                    await ctx.send(_tr(
+                        lang,
+                        f"This card already has an active {charm_type} charm.",
+                        f"This card already has an active {charm_type} charm.",
+                        f"This card already has an active {charm_type} charm."
+                    ))
+                    return
+
+                locked_inventory_query = """
+                SELECT ip.*, p.product_icon FROM inventory i
+                JOIN inventory_product ip ON i.inventory_id = ip.inventory_id
+                JOIN product p ON ip.product_id = p.product_id
+                WHERE i.user_id = %s AND ip.product_id = %s
+                FOR UPDATE
+                """
+                inventory_result = await execute_query_with_retry(
+                    locked_inventory_query,
+                    (user_id, charm_data['product_id'])
+                )
+                if not inventory_result or inventory_result[0]['quantiter'] <= 0:
+                    await ctx.send(_tr(
+                        lang,
+                        f"You don't have a {charm_type} charm in your inventory.",
+                        f"You don't have a {charm_type} charm in your inventory.",
+                        f"You don't have a {charm_type} charm in your inventory."
+                    ))
+                    return
+
+                # Consume one charm and apply it together so partial updates roll back.
+                if inventory_result[0]['quantiter'] == 1:
+                    await execute_query_with_retry(
+                        "DELETE FROM inventory_product WHERE id_ligneinventoryproduct = %s",
+                        (inventory_result[0]['id_ligneinventoryproduct'],)
+                    )
+                else:
+                    await execute_query_with_retry(
+                        "UPDATE inventory_product SET quantiter = quantiter - 1 WHERE id_ligneinventoryproduct = %s AND quantiter > 0",
+                        (inventory_result[0]['id_ligneinventoryproduct'],)
+                    )
+
+                update_query = f"""
+                UPDATE user_cards
+                SET
+                    {charm_data['charm_column']} = %s,
+                    {charm_data['count_column']} = {charm_data['count_column']} + %s
+                WHERE id_ligneusercards = %s AND {charm_data['charm_column']} = 0
+                """
+                await execute_query_with_retry(
+                    update_query,
+                    (charm_data['product_id'], charm_count, card['id_ligneusercards'])
+                )
 
             await ctx.send(_tr(
                 lang,
@@ -7631,6 +8116,8 @@ class InventoryCommands(commands.Cog):
 
 
     @commands.command(name="charm", aliases=["chm", "chr"])
+    @advisory_lock_for_context("slbot:inventory")
+    @block_during_user_activity(get_user_multilanguage)
     async def charm(self, ctx, charm_type: str, *, card_name: str):
         lang = await get_user_multilanguage(ctx.author.id)  # 0=en, 1=ar, 2=fr
         try:
@@ -7765,7 +8252,7 @@ class InventoryCommands(commands.Cog):
             WHERE i.user_id = %s AND ip.product_id = %s
             """
             inventory_result = await execute_query_with_retry(inventory_query, (user_id, charm_data['product_id']))
-            if not inventory_result:
+            if not inventory_result or inventory_result[0]['quantiter'] <= 0:
                 await ctx.send(_tr(
                     lang,
                     f"You don't have a {charm_type} charm in your inventory.",
@@ -7774,23 +8261,73 @@ class InventoryCommands(commands.Cog):
                 ))
                 return
 
-            # Consume one
-            if inventory_result[0]['quantiter'] == 1:
-                await execute_query_with_retry("DELETE FROM inventory_product WHERE id_ligneinventoryproduct = %s",
-                                            (inventory_result[0]['id_ligneinventoryproduct'],))
-            else:
-                await execute_query_with_retry("UPDATE inventory_product SET quantiter = quantiter - 1 WHERE id_ligneinventoryproduct = %s",
-                                            (inventory_result[0]['id_ligneinventoryproduct'],))
+            async with db_transaction():
+                locked_card_query = """
+                SELECT u.*, c.card_icon, c.type_card
+                FROM user_cards u
+                JOIN card c ON u.card_id = c.card_id
+                WHERE u.id_ligneusercards = %s
+                FOR UPDATE
+                """
+                locked_card_result = await execute_query_with_retry(
+                    locked_card_query,
+                    (card['id_ligneusercards'],)
+                )
+                if not locked_card_result:
+                    await ctx.send(_tr(
+                        lang,
+                        "You don't have a card with the name you specified.",
+                        "You don't have a card with the name you specified.",
+                        "You don't have a card with the name you specified."
+                    ))
+                    return
 
-            # Apply charm
-            update_query = f"""
-            UPDATE user_cards
-            SET
-                {charm_data['charm_column']} = %s,
-                {charm_data['count_column']} = {charm_data['count_column']} + %s
-            WHERE user_id = %s AND name = %s
-            """
-            await execute_query_with_retry(update_query, (charm_data['product_id'], charm_count, user_id, card['name']))
+                card = locked_card_result[0]
+                if card[charm_data['charm_column']] != 0:
+                    await ctx.send(_tr(
+                        lang,
+                        f"This card already has an active {charm_type} charm.",
+                        f"This card already has an active {charm_type} charm.",
+                        f"This card already has an active {charm_type} charm."
+                    ))
+                    return
+
+                locked_inventory_query = """
+                SELECT ip.*, p.product_icon FROM inventory i
+                JOIN inventory_product ip ON i.inventory_id = ip.inventory_id
+                JOIN product p ON ip.product_id = p.product_id
+                WHERE i.user_id = %s AND ip.product_id = %s
+                FOR UPDATE
+                """
+                inventory_result = await execute_query_with_retry(
+                    locked_inventory_query,
+                    (user_id, charm_data['product_id'])
+                )
+                if not inventory_result or inventory_result[0]['quantiter'] <= 0:
+                    await ctx.send(_tr(
+                        lang,
+                        f"You don't have a {charm_type} charm in your inventory.",
+                        f"You don't have a {charm_type} charm in your inventory.",
+                        f"You don't have a {charm_type} charm in your inventory."
+                    ))
+                    return
+
+                # Consume one charm and apply it together so partial updates roll back.
+                if inventory_result[0]['quantiter'] == 1:
+                    await execute_query_with_retry("DELETE FROM inventory_product WHERE id_ligneinventoryproduct = %s",
+                                                (inventory_result[0]['id_ligneinventoryproduct'],))
+                else:
+                    await execute_query_with_retry("UPDATE inventory_product SET quantiter = quantiter - 1 WHERE id_ligneinventoryproduct = %s AND quantiter > 0",
+                                                (inventory_result[0]['id_ligneinventoryproduct'],))
+
+                update_query = f"""
+                UPDATE user_cards
+                SET
+                    {charm_data['charm_column']} = %s,
+                    {charm_data['count_column']} = {charm_data['count_column']} + %s
+                WHERE id_ligneusercards = %s AND {charm_data['charm_column']} = 0
+                """
+                await execute_query_with_retry(update_query, (charm_data['product_id'], charm_count, card['id_ligneusercards']))
 
             await ctx.send(_tr(
                 lang,
@@ -7810,6 +8347,9 @@ class InventoryCommands(commands.Cog):
 
 
     @commands.command(name="capsule", aliases=["cap", "cs"])
+    @advisory_lock_for_context("slbot:inventory")
+    @block_during_user_activity(get_user_multilanguage)
+    @transaction_for_context()
     async def capsule(self, ctx, capsule_type, *args):
         lang = await get_user_multilanguage(ctx.author.id)
         try:
@@ -7896,6 +8436,23 @@ class InventoryCommands(commands.Cog):
                 return
 
             card = card_result[0]
+            locked_card_query = """
+            SELECT u.*, c.card_icon, c.type_card
+            FROM user_cards u
+            JOIN card c ON u.card_id = c.card_id
+            WHERE u.id_ligneusercards = %s
+            FOR UPDATE
+            """
+            locked_card_result = await execute_query_with_retry(locked_card_query, (card['id_ligneusercards'],))
+            if not locked_card_result:
+                await ctx.send(_tr(
+                    lang,
+                    "This card could not be locked for capsule use. Please try again.",
+                    "This card could not be locked for capsule use. Please try again.",
+                    "Cette carte n'a pas pu etre verrouillee pour la capsule. Veuillez reessayer."
+                ))
+                return
+            card = locked_card_result[0]
 
             cap_map = {
                 'acap': ('used_attackpoints', 'current_cap_attack'),
@@ -7975,6 +8532,7 @@ class InventoryCommands(commands.Cog):
             JOIN inventory_product ip ON i.inventory_id = ip.inventory_id
             JOIN product p ON ip.product_id = p.product_id
             WHERE i.user_id = %s AND ip.product_id = %s
+            FOR UPDATE
             """
             inventory_result = await execute_query_with_retry(inventory_query, (user_id, product_id))
             if not inventory_result:
@@ -8000,8 +8558,8 @@ class InventoryCommands(commands.Cog):
                 await execute_query_with_retry("DELETE FROM inventory_product WHERE id_ligneinventoryproduct = %s",
                                             (inventory_item['id_ligneinventoryproduct'],))
             else:
-                await execute_query_with_retry("UPDATE inventory_product SET quantiter = quantiter - %s WHERE id_ligneinventoryproduct = %s",
-                                            (quantity, inventory_item['id_ligneinventoryproduct']))
+                await execute_query_with_retry("UPDATE inventory_product SET quantiter = quantiter - %s WHERE id_ligneinventoryproduct = %s AND quantiter >= %s",
+                                            (quantity, inventory_item['id_ligneinventoryproduct'], quantity))
 
             # Stat mapping
             stat_map = {
@@ -8263,7 +8821,11 @@ class InventoryCommands(commands.Cog):
                 f"حدث خطأ: {str(e)}",
                 f"Une erreur s'est produite : {str(e)}"
             ))
+            raise_transaction_rollback()
     @commands.command(name="hcapsule", aliases=["hcap", "hcs"])
+    @advisory_lock_for_context("slbot:inventory")
+    @block_during_user_activity(get_user_multilanguage)
+    @transaction_for_context()
     async def hcapsule(self, ctx, capsule_type, *args):
         lang = await get_user_multilanguage(ctx.author.id)
         try:
@@ -8350,6 +8912,23 @@ class InventoryCommands(commands.Cog):
                 return
 
             card = card_result[0]
+            locked_card_query = """
+            SELECT u.*, c.card_icon, c.type_card
+            FROM user_cards u
+            JOIN card c ON u.card_id = c.card_id
+            WHERE u.id_ligneusercards = %s
+            FOR UPDATE
+            """
+            locked_card_result = await execute_query_with_retry(locked_card_query, (card['id_ligneusercards'],))
+            if not locked_card_result:
+                await ctx.send(_tr(
+                    lang,
+                    "This card could not be locked for capsule use. Please try again.",
+                    "This card could not be locked for capsule use. Please try again.",
+                    "Cette carte n'a pas pu etre verrouillee pour la capsule. Veuillez reessayer."
+                ))
+                return
+            card = locked_card_result[0]
 
             cap_map = {
                 'acap': ('used_attackpoints', 'current_cap_attack'),
@@ -8432,6 +9011,7 @@ class InventoryCommands(commands.Cog):
             JOIN inventory_product ip ON i.inventory_id = ip.inventory_id
             JOIN product p ON ip.product_id = p.product_id
             WHERE i.user_id = %s AND ip.product_id = %s
+            FOR UPDATE
             """
             inventory_result = await execute_query_with_retry(inventory_query, (user_id, product_id))
             if not inventory_result:
@@ -8457,8 +9037,8 @@ class InventoryCommands(commands.Cog):
                 await execute_query_with_retry("DELETE FROM inventory_product WHERE id_ligneinventoryproduct = %s",
                                             (inventory_item['id_ligneinventoryproduct'],))
             else:
-                await execute_query_with_retry("UPDATE inventory_product SET quantiter = quantiter - %s WHERE id_ligneinventoryproduct = %s",
-                                            (quantity, inventory_item['id_ligneinventoryproduct']))
+                await execute_query_with_retry("UPDATE inventory_product SET quantiter = quantiter - %s WHERE id_ligneinventoryproduct = %s AND quantiter >= %s",
+                                            (quantity, inventory_item['id_ligneinventoryproduct'], quantity))
 
             # Stat mapping
             stat_map = {
@@ -8720,7 +9300,10 @@ class InventoryCommands(commands.Cog):
                 f"حدث خطأ: {str(e)}",
                 f"Une erreur s'est produite : {str(e)}"
             ))
+            raise_transaction_rollback()
     @commands.command(name="henhance", aliases=["henh", "hen"])
+    @advisory_lock_for_context("slbot:inventory")
+    @block_during_user_activity(get_user_multilanguage)
     async def henhance(self, ctx, *, card_name):
         lang = await get_user_multilanguage(ctx.author.id)
         try:
@@ -8829,7 +9412,7 @@ class InventoryCommands(commands.Cog):
         # Inventory check (product 17)
         inventory_query = "SELECT ip.*,p.product_icon FROM inventory i JOIN inventory_product ip ON i.inventory_id = ip.inventory_id JOIN product p ON ip.product_id = p.product_id  WHERE i.user_id = %s AND ip.product_id = 29"
         inventory_result = await execute_query_with_retry(inventory_query, (user_id,))
-        if not inventory_result:
+        if not inventory_result or inventory_result[0]['quantiter'] <= 0:
             await ctx.send(_tr(
                 lang,
                 "You don't have an enhancer in your inventory.",
@@ -8838,17 +9421,76 @@ class InventoryCommands(commands.Cog):
             ))
             return
 
-        # Consume enhancer
-        if inventory_result[0]['quantiter'] == 1:
-            await execute_query_with_retry("DELETE FROM inventory_product WHERE id_ligneinventoryproduct = %s",
-                                        (inventory_result[0]['id_ligneinventoryproduct'],))
-        else:
-            await execute_query_with_retry("UPDATE inventory_product SET quantiter = quantiter - 1 WHERE id_ligneinventoryproduct = %s",
-                                        (inventory_result[0]['id_ligneinventoryproduct'],))
+        async with db_transaction():
+            locked_card_query = """
+            SELECT u.*, c.card_icon, c.type_card
+            FROM user_cards u
+            JOIN card c ON u.card_id = c.card_id
+            WHERE u.id_ligneusercards = %s
+            FOR UPDATE
+            """
+            locked_card_result = await execute_query_with_retry(
+                locked_card_query,
+                (card['id_ligneusercards'],)
+            )
+            if not locked_card_result:
+                await ctx.send(_tr(
+                    lang,
+                    f"You don't have a card named {card_name}.",
+                    f"You don't have a card named {card_name}.",
+                    f"You don't have a card named {card_name}."
+                ))
+                return
 
-        # Apply
-        await execute_query_with_retry("UPDATE user_cards SET id_enhancer = 29,fight_count=3 WHERE user_id = %s AND name = %s",
-                                    (user_id, card['name']))
+            card = locked_card_result[0]
+            if card['current_level'] >= card['max_leveled']:
+                await ctx.send(_tr(
+                    lang,
+                    f"{card['card_icon']} {card['name']} is already at max level and cannot be enhanced further.",
+                    f"{card['card_icon']} {card['name']} is already at max level and cannot be enhanced further.",
+                    f"{card['card_icon']} {card['name']} is already at max level and cannot be enhanced further."
+                ))
+                return
+
+            if card['id_enhancer']:
+                await ctx.send(_tr(
+                    lang,
+                    f"{card['card_icon']} {card['name']} already has an active enhancer.",
+                    f"{card['card_icon']} {card['name']} already has an active enhancer.",
+                    f"{card['card_icon']} {card['name']} already has an active enhancer."
+                ))
+                return
+
+            locked_inventory_query = """
+            SELECT ip.*, p.product_icon
+            FROM inventory i
+            JOIN inventory_product ip ON i.inventory_id = ip.inventory_id
+            JOIN product p ON ip.product_id = p.product_id
+            WHERE i.user_id = %s AND ip.product_id = 29
+            FOR UPDATE
+            """
+            inventory_result = await execute_query_with_retry(locked_inventory_query, (user_id,))
+            if not inventory_result or inventory_result[0]['quantiter'] <= 0:
+                await ctx.send(_tr(
+                    lang,
+                    "You don't have an enhancer in your inventory.",
+                    "You don't have an enhancer in your inventory.",
+                    "You don't have an enhancer in your inventory."
+                ))
+                return
+
+            # Consume enhancer and apply it together so partial updates roll back.
+            if inventory_result[0]['quantiter'] == 1:
+                await execute_query_with_retry("DELETE FROM inventory_product WHERE id_ligneinventoryproduct = %s",
+                                            (inventory_result[0]['id_ligneinventoryproduct'],))
+            else:
+                await execute_query_with_retry("UPDATE inventory_product SET quantiter = quantiter - 1 WHERE id_ligneinventoryproduct = %s AND quantiter > 0",
+                                            (inventory_result[0]['id_ligneinventoryproduct'],))
+
+            await execute_query_with_retry(
+                "UPDATE user_cards SET id_enhancer = 29, fight_count = 3 WHERE id_ligneusercards = %s AND (id_enhancer IS NULL OR id_enhancer = 0)",
+                (card['id_ligneusercards'],)
+            )
 
         await ctx.send(_tr(
             lang,
@@ -8912,6 +9554,8 @@ class InventoryCommands(commands.Cog):
         return None, None
     @commands.command(name="skinequip", aliases=["skequip", "sek"])
     @command_cooldown(rate=1, per=3.0)
+    @advisory_lock_for_context("slbot:inventory")
+    @block_during_user_activity(get_user_multilanguage)
     async def skin_equip(self, ctx, *, args: str = None):
         """Equip a skin to a card: skinequip skin_name,card_name"""
         lang = await get_user_multilanguage(ctx.author.id)
@@ -8986,15 +9630,40 @@ class InventoryCommands(commands.Cog):
                 await ctx.send(_tr(lang, "You don't have this card.", "ليس لديك هذه البطاقة.", "Vous n'avez pas cette carte."))
                 return
             
-            if quantity == 1:
-                q_del = "DELETE FROM inventory_skins WHERE inventory_id = %s AND skin_id = %s"
-                await execute_query_with_retry(q_del, (inventory_id, skin_id))
-            else:
-                q_upd = "UPDATE inventory_skins SET quantiter = quantiter - 1 WHERE inventory_id = %s AND skin_id = %s"
-                await execute_query_with_retry(q_upd, (inventory_id, skin_id))
-            
-            q_upd_card = "UPDATE user_cards SET image = %s WHERE user_id = %s AND card_id = %s"
-            await execute_query_with_retry(q_upd_card, (skin_image, user_id, card_id))
+            async with db_transaction():
+                q_inv_skin_locked = """
+                SELECT quantiter
+                FROM inventory_skins
+                WHERE inventory_id = %s AND skin_id = %s
+                FOR UPDATE
+                """
+                inv_skin = await execute_query_with_retry(q_inv_skin_locked, (inventory_id, skin_id))
+                if not inv_skin or inv_skin[0]['quantiter'] <= 0:
+                    await ctx.send(_tr(
+                        lang,
+                        "You don't have this skin in your inventory.",
+                        "You don't have this skin in your inventory.",
+                        "You don't have this skin in your inventory."
+                    ))
+                    return
+
+                q_user_card_locked = "SELECT id_ligneusercards FROM user_cards WHERE user_id = %s AND card_id = %s FOR UPDATE"
+                user_card = await execute_query_with_retry(q_user_card_locked, (user_id, card_id))
+                if not user_card:
+                    await ctx.send(_tr(lang, "You don't have this card.", "You don't have this card.", "You don't have this card."))
+                    return
+
+                # Consume skin and update the card image together.
+                quantity = inv_skin[0]['quantiter']
+                if quantity == 1:
+                    q_del = "DELETE FROM inventory_skins WHERE inventory_id = %s AND skin_id = %s"
+                    await execute_query_with_retry(q_del, (inventory_id, skin_id))
+                else:
+                    q_upd = "UPDATE inventory_skins SET quantiter = quantiter - 1 WHERE inventory_id = %s AND skin_id = %s AND quantiter > 0"
+                    await execute_query_with_retry(q_upd, (inventory_id, skin_id))
+
+                q_upd_card = "UPDATE user_cards SET image = %s WHERE user_id = %s AND card_id = %s"
+                await execute_query_with_retry(q_upd_card, (skin_image, user_id, card_id))
             
             embed = discord.Embed(
                 title=_tr(lang, "Skin Equipped", "تم تجهيز القناع", "Skin équipé"),
@@ -9009,6 +9678,8 @@ class InventoryCommands(commands.Cog):
     
     @commands.command(name="skinunequip", aliases=["skunequip", "suk"])
     @command_cooldown(rate=1, per=3.0)
+    @advisory_lock_for_context("slbot:inventory")
+    @block_during_user_activity(get_user_multilanguage)
     async def skin_unequip(self, ctx, *, args: str = None):
         """Unequip a skin from a card: skinunequip skin_name,card_name"""
         lang = await get_user_multilanguage(ctx.author.id)
@@ -9094,18 +9765,29 @@ class InventoryCommands(commands.Cog):
             
             original_image = card_img[0]['card_image']
             
-            q_upd_card = "UPDATE user_cards SET image = %s WHERE user_id = %s AND card_id = %s"
-            await execute_query_with_retry(q_upd_card, (original_image, user_id, card_id))
-            
-            q_inv_skin = "SELECT quantiter FROM inventory_skins WHERE inventory_id = %s AND skin_id = %s"
-            inv_skin = await execute_query_with_retry(q_inv_skin, (inventory_id, skin_id))
-            
-            if inv_skin:
-                q_upd_inv = "UPDATE inventory_skins SET quantiter = quantiter + 1 WHERE inventory_id = %s AND skin_id = %s"
-                await execute_query_with_retry(q_upd_inv, (inventory_id, skin_id))
-            else:
-                q_ins_inv = "INSERT INTO inventory_skins (inventory_id, skin_id, quantiter) VALUES (%s, %s, 1)"
-                await execute_query_with_retry(q_ins_inv, (inventory_id, skin_id))
+            async with db_transaction():
+                q_user_card_locked = "SELECT image FROM user_cards WHERE user_id = %s AND card_id = %s FOR UPDATE"
+                user_card = await execute_query_with_retry(q_user_card_locked, (user_id, card_id))
+                if not user_card:
+                    await ctx.send(_tr(lang, "You don't have this card.", "You don't have this card.", "You don't have this card."))
+                    return
+                if user_card[0]['image'] != skin_image:
+                    await ctx.send(_tr(lang, "This skin is not equipped on this card.", "This skin is not equipped on this card.", "This skin is not equipped on this card."))
+                    return
+
+                # Restore card image and return the skin to inventory together.
+                q_upd_card = "UPDATE user_cards SET image = %s WHERE user_id = %s AND card_id = %s"
+                await execute_query_with_retry(q_upd_card, (original_image, user_id, card_id))
+
+                q_inv_skin = "SELECT quantiter FROM inventory_skins WHERE inventory_id = %s AND skin_id = %s FOR UPDATE"
+                inv_skin = await execute_query_with_retry(q_inv_skin, (inventory_id, skin_id))
+
+                if inv_skin:
+                    q_upd_inv = "UPDATE inventory_skins SET quantiter = quantiter + 1 WHERE inventory_id = %s AND skin_id = %s"
+                    await execute_query_with_retry(q_upd_inv, (inventory_id, skin_id))
+                else:
+                    q_ins_inv = "INSERT INTO inventory_skins (inventory_id, skin_id, quantiter) VALUES (%s, %s, 1)"
+                    await execute_query_with_retry(q_ins_inv, (inventory_id, skin_id))
             
             embed = discord.Embed(
                 title=_tr(lang, "Skin Unequipped", "تم إزالة القناع", "Skin retiré"),
@@ -9118,6 +9800,8 @@ class InventoryCommands(commands.Cog):
         except Exception as e:
             await ctx.send(_tr(lang, f"An error occurred: {str(e)}", f"حدث خطأ: {str(e)}", f"Une erreur s'est produite : {str(e)}"))
     @commands.command(name="enhance", aliases=["enh", "en"])
+    @advisory_lock_for_context("slbot:inventory")
+    @block_during_user_activity(get_user_multilanguage)
     async def enhance(self, ctx, *, card_name):
         lang = await get_user_multilanguage(ctx.author.id)
         try:
@@ -9226,7 +9910,7 @@ class InventoryCommands(commands.Cog):
         # Inventory check (product 17)
         inventory_query = "SELECT ip.*,p.product_icon FROM inventory i JOIN inventory_product ip ON i.inventory_id = ip.inventory_id JOIN product p ON ip.product_id = p.product_id  WHERE i.user_id = %s AND ip.product_id = 17"
         inventory_result = await execute_query_with_retry(inventory_query, (user_id,))
-        if not inventory_result:
+        if not inventory_result or inventory_result[0]['quantiter'] <= 0:
             await ctx.send(_tr(
                 lang,
                 "You don't have an enhancer in your inventory.",
@@ -9235,17 +9919,76 @@ class InventoryCommands(commands.Cog):
             ))
             return
 
-        # Consume enhancer
-        if inventory_result[0]['quantiter'] == 1:
-            await execute_query_with_retry("DELETE FROM inventory_product WHERE id_ligneinventoryproduct = %s",
-                                        (inventory_result[0]['id_ligneinventoryproduct'],))
-        else:
-            await execute_query_with_retry("UPDATE inventory_product SET quantiter = quantiter - 1 WHERE id_ligneinventoryproduct = %s",
-                                        (inventory_result[0]['id_ligneinventoryproduct'],))
+        async with db_transaction():
+            locked_card_query = """
+            SELECT u.*, c.card_icon, c.type_card
+            FROM user_cards u
+            JOIN card c ON u.card_id = c.card_id
+            WHERE u.id_ligneusercards = %s
+            FOR UPDATE
+            """
+            locked_card_result = await execute_query_with_retry(
+                locked_card_query,
+                (card['id_ligneusercards'],)
+            )
+            if not locked_card_result:
+                await ctx.send(_tr(
+                    lang,
+                    f"You don't have a card named {card_name}.",
+                    f"You don't have a card named {card_name}.",
+                    f"You don't have a card named {card_name}."
+                ))
+                return
 
-        # Apply
-        await execute_query_with_retry("UPDATE user_cards SET id_enhancer = 17,fight_count=3 WHERE user_id = %s AND name = %s",
-                                    (user_id, card['name']))
+            card = locked_card_result[0]
+            if card['current_level'] >= card['max_leveled']:
+                await ctx.send(_tr(
+                    lang,
+                    f"{card['card_icon']} {card['name']} is already at max level and cannot be enhanced further.",
+                    f"{card['card_icon']} {card['name']} is already at max level and cannot be enhanced further.",
+                    f"{card['card_icon']} {card['name']} is already at max level and cannot be enhanced further."
+                ))
+                return
+
+            if card['id_enhancer']:
+                await ctx.send(_tr(
+                    lang,
+                    f"{card['card_icon']} {card['name']} already has an active enhancer.",
+                    f"{card['card_icon']} {card['name']} already has an active enhancer.",
+                    f"{card['card_icon']} {card['name']} already has an active enhancer."
+                ))
+                return
+
+            locked_inventory_query = """
+            SELECT ip.*, p.product_icon
+            FROM inventory i
+            JOIN inventory_product ip ON i.inventory_id = ip.inventory_id
+            JOIN product p ON ip.product_id = p.product_id
+            WHERE i.user_id = %s AND ip.product_id = 17
+            FOR UPDATE
+            """
+            inventory_result = await execute_query_with_retry(locked_inventory_query, (user_id,))
+            if not inventory_result or inventory_result[0]['quantiter'] <= 0:
+                await ctx.send(_tr(
+                    lang,
+                    "You don't have an enhancer in your inventory.",
+                    "You don't have an enhancer in your inventory.",
+                    "You don't have an enhancer in your inventory."
+                ))
+                return
+
+            # Consume enhancer and apply it together so partial updates roll back.
+            if inventory_result[0]['quantiter'] == 1:
+                await execute_query_with_retry("DELETE FROM inventory_product WHERE id_ligneinventoryproduct = %s",
+                                            (inventory_result[0]['id_ligneinventoryproduct'],))
+            else:
+                await execute_query_with_retry("UPDATE inventory_product SET quantiter = quantiter - 1 WHERE id_ligneinventoryproduct = %s AND quantiter > 0",
+                                            (inventory_result[0]['id_ligneinventoryproduct'],))
+
+            await execute_query_with_retry(
+                "UPDATE user_cards SET id_enhancer = 17, fight_count = 3 WHERE id_ligneusercards = %s AND (id_enhancer IS NULL OR id_enhancer = 0)",
+                (card['id_ligneusercards'],)
+            )
 
         await ctx.send(_tr(
             lang,
@@ -9907,6 +10650,8 @@ class InventoryCommands(commands.Cog):
             await ctx.send(embed=embed)
 
     @commands.command(name="sell", aliases=["sl", "se"])
+    @advisory_lock_for_context("slbot:inventory")
+    @block_during_user_activity(get_user_multilanguage)
     async def sell_fragment(self, ctx, *, args):
         lang = await get_user_multilanguage(ctx.author.id)
         langs = await get_user_multilanguage(ctx.author.id)
@@ -9994,8 +10739,15 @@ class InventoryCommands(commands.Cog):
                 ))
                 return
 
-            # Mark as pending
-            await execute_query_with_retry("INSERT INTO sell_status (user_id) VALUES (%s)", (user_id,))
+            # Mark as pending atomically.
+            if not await claim_user_status_row("sell_status", user_id):
+                await ctx.send(_tr(
+                    langs,
+                    "⚠️ You already have a pending sell operation. Please complete or cancel your previous sell before starting a new one.",
+                    "⚠️ لديك عملية بيع قيد الانتظار بالفعل. أكمل أو ألغِ السابقة قبل البدء بجديدة.",
+                    "⚠️ Vous avez déjà une vente en attente. Terminez ou annulez-la avant d’en commencer une nouvelle."
+                ))
+                return
 
             # Inventory
             inventory_query = "SELECT inventory_id FROM inventory WHERE user_id = %s"
@@ -10272,6 +11024,33 @@ class InventoryCommands(commands.Cog):
                 ))
                 return
 
+            await self._apply_fragment_sale_transaction(user_id, inventory_id, fragments_summary, total_amount)
+
+            if is_rank_sale:
+                success_embed = discord.Embed(
+                    title=_tr(langs, "Rank Sale Successful", "Rank Sale Successful", "Vente par rang reussie"),
+                    description=_tr(
+                        langs,
+                        f"Successfully sold all Rank {rank} essence stones for {total_amount:,}",
+                        f"Successfully sold all Rank {rank} essence stones for {total_amount:,}",
+                        f"Toutes les pierres d'essence de rang {rank} vendues pour {total_amount:,}"
+                    ),
+                    color=discord.Color.green()
+                )
+            else:
+                success_embed = discord.Embed(
+                    title=_tr(langs, "Sale Successful", "Sale Successful", "Vente reussie"),
+                    description=_tr(
+                        langs,
+                        f"Successfully sold {fragments_summary[0]['quantity']} {fragments_summary[0]['name']} for {total_amount:,}",
+                        f"Successfully sold {fragments_summary[0]['quantity']} {fragments_summary[0]['name']} for {total_amount:,}",
+                        f"{fragments_summary[0]['quantity']} {fragments_summary[0]['name']} vendus pour {total_amount:,}"
+                    ),
+                    color=discord.Color.green()
+                )
+            await ctx.send(embed=success_embed)
+            return
+
             # Verify fragments still present
             for fragment in fragments_summary:
                 inventory_check_query = """
@@ -10356,18 +11135,7 @@ class InventoryCommands(commands.Cog):
                         (new_count, completion_status, quest['userquests_id'])
                     )
                     if completion_status == 1:
-                        check_chest_query = "SELECT * FROM inventory_chest WHERE inventory_id = %s AND chest_id = 1"
-                        chest_result = await execute_query_with_retry(check_chest_query, (inventory_id,))
-                        if chest_result:
-                            await execute_query_with_retry(
-                                "UPDATE inventory_chest SET quantiter = quantiter + 1 WHERE inventory_id = %s AND chest_id = 1",
-                                (inventory_id,)
-                            )
-                        else:
-                            await execute_query_with_retry(
-                                "INSERT INTO inventory_chest (inventory_id, chest_id, quantiter) VALUES (%s, 1, 1)",
-                                (inventory_id,)
-                            )
+                        await add_inventory_quantity("inventory_chest", inventory_id, 1, 1)
 
             # Success embed
             if is_rank_sale:
@@ -10485,8 +11253,8 @@ class InventoryCommands(commands.Cog):
             title = _tr(lang, "🎃 Halloween Weapons", "🎃 أسلحة الهالوين", "🎃 Armes d'Halloween")
             embed = discord.Embed(title=title, color=0xFF6600)
             embed.set_author(
-                name=_tr(lang, f"{ctx.author.name}'s Halloween Arsenal", 
-                        f"ترسانة الهالوين لـ {ctx.author.name}", 
+                name=_tr(lang, f"{ctx.author.name}'s Halloween Arsenal",
+                        f"ترسانة الهالوين لـ {ctx.author.name}",
                         f"Arsenal d'Halloween de {ctx.author.name}"),
                 icon_url=ctx.author.avatar.url if ctx.author.avatar else None
             )
@@ -10515,16 +11283,16 @@ class InventoryCommands(commands.Cog):
                 description += "\n\n" + "\n\n".join(weapons_display)
             
             embed.description = description
-            embed.set_footer(text=_tr(lang, 
-                                    "Halloween Special Collection", 
-                                    "مجموعة خاصة بالهالوين", 
+            embed.set_footer(text=_tr(lang,
+                                    "Halloween Special Collection",
+                                    "مجموعة خاصة بالهالوين",
                                     "Collection Spéciale Halloween"))
             
             await ctx.send(embed=embed)
             
         except Exception as e:
-            await ctx.send(_tr(lang, f"An error occurred: {str(e)}", 
-                            f"حدث خطأ: {str(e)}", 
+            await ctx.send(_tr(lang, f"An error occurred: {str(e)}",
+                            f"حدث خطأ: {str(e)}",
                             f"Une erreur s'est produite : {str(e)}"))
 
     @commands.command(name="invweapon", aliases=["iw", "iwp"])

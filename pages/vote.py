@@ -9,6 +9,7 @@ from typing import Dict, Any, Optional, Tuple, List
 from enum import Enum
 from collections import deque
 from utils.database import execute_query_with_retry, get_metrics
+from utils.db_atomic import db_advisory_lock, db_transaction
 import functools
 from aiohttp import web
 import hmac
@@ -177,10 +178,219 @@ class VoteCommands(commands.Cog):
         received = (auth_header or "").strip()
         return hmac.compare_digest(received, secret)
 
+    async def process_vote_reward_atomic(self, user_id: int):
+        current_time = datetime.now()
+        quest_completed = False
+        already_claimed_until = None
+
+        async with db_advisory_lock(f"slbot:vote:{user_id}", timeout=5):
+            async with db_transaction():
+                user_rows = await execute_query_with_retry(
+                    """
+                    SELECT user_id, votecount, votestreak, vote_timer
+                    FROM user
+                    WHERE user_authorid = %s
+                    FOR UPDATE
+                    """,
+                    (str(user_id),)
+                )
+                if not user_rows:
+                    print(f"User {user_id} not found in database, cannot process vote")
+                    return None
+
+                user_data = user_rows[0]
+                db_user_id = user_data['user_id']
+                vote_timer = user_data.get('vote_timer')
+
+                if vote_timer:
+                    time_since_vote = current_time - vote_timer
+                    if time_since_vote.total_seconds() < 43200:
+                        already_claimed_until = vote_timer + timedelta(hours=12)
+                        return {
+                            "already_claimed_until": already_claimed_until,
+                            "votecount": user_data['votecount'],
+                            "votestreak": user_data['votestreak'],
+                            "quest_completed": False,
+                        }
+
+                votecount = user_data['votecount'] + 1
+                if vote_timer is None:
+                    votestreak = 1
+                else:
+                    time_diff = current_time - vote_timer
+                    votestreak = 1 if time_diff.total_seconds() > 86400 else user_data['votestreak'] + 1
+
+                await execute_query_with_retry(
+                    """
+                    UPDATE user
+                    SET votecount = %s,
+                        votestreak = %s,
+                        vote_timer = %s,
+                        candy_currency = COALESCE(candy_currency, 0) + %s
+                    WHERE user_id = %s
+                    """,
+                    (votecount, votestreak, current_time, 20, db_user_id)
+                )
+
+                inventory_rows = await execute_query_with_retry(
+                    "SELECT inventory_id FROM inventory WHERE user_id = %s FOR UPDATE",
+                    (db_user_id,)
+                )
+                if not inventory_rows:
+                    print(f"Could not find inventory for user {user_id}")
+                    return None
+
+                inventory_id = inventory_rows[0]['inventory_id']
+                product_rows = await execute_query_with_retry(
+                    """
+                    SELECT quantiter
+                    FROM inventory_product
+                    WHERE inventory_id = %s AND product_id = 2
+                    FOR UPDATE
+                    """,
+                    (inventory_id,)
+                )
+                if product_rows:
+                    await execute_query_with_retry(
+                        """
+                        UPDATE inventory_product
+                        SET quantiter = quantiter + 1
+                        WHERE inventory_id = %s AND product_id = 2
+                        """,
+                        (inventory_id,)
+                    )
+                else:
+                    await execute_query_with_retry(
+                        """
+                        INSERT INTO inventory_product (inventory_id, product_id, quantiter)
+                        VALUES (%s, 2, 1)
+                        """,
+                        (inventory_id,)
+                    )
+
+                quest_rows = await execute_query_with_retry(
+                    """
+                    SELECT uq.userquests_id, uq.current_count, uq.completion_status, q.required_count
+                    FROM user_quests uq
+                    JOIN quest q ON uq.quest_id = q.quest_id
+                    WHERE uq.user_id = %s AND q.quest_name = 'Vote 1 time'
+                    FOR UPDATE
+                    """,
+                    (db_user_id,)
+                )
+                if quest_rows and quest_rows[0]['completion_status'] == 0:
+                    quest = quest_rows[0]
+                    new_count = quest['current_count'] + 1
+                    completion_status = 1 if new_count >= quest['required_count'] else 0
+                    await execute_query_with_retry(
+                        """
+                        UPDATE user_quests
+                        SET current_count = %s, completion_status = %s
+                        WHERE userquests_id = %s
+                        """,
+                        (new_count, completion_status, quest['userquests_id'])
+                    )
+                    if completion_status == 1:
+                        quest_completed = True
+                        chest_rows = await execute_query_with_retry(
+                            """
+                            SELECT quantiter
+                            FROM inventory_chest
+                            WHERE inventory_id = %s AND chest_id = 1
+                            FOR UPDATE
+                            """,
+                            (inventory_id,)
+                        )
+                        if chest_rows:
+                            await execute_query_with_retry(
+                                """
+                                UPDATE inventory_chest
+                                SET quantiter = quantiter + 1
+                                WHERE inventory_id = %s AND chest_id = 1
+                                """,
+                                (inventory_id,)
+                            )
+                        else:
+                            await execute_query_with_retry(
+                                """
+                                INSERT INTO inventory_chest (inventory_id, chest_id, quantiter)
+                                VALUES (%s, 1, 1)
+                                """,
+                                (inventory_id,)
+                            )
+
+        return {
+            "already_claimed_until": already_claimed_until,
+            "votecount": votecount,
+            "votestreak": votestreak,
+            "quest_completed": quest_completed,
+        }
+
    
     async def process_vote_reward(self, user_id: int):
         """Process vote rewards and send DM to user"""
         try:
+            reward_result = await self.process_vote_reward_atomic(user_id)
+            if not reward_result:
+                return
+
+            user = await self.bot.fetch_user(user_id)
+            already_claimed_until = reward_result["already_claimed_until"]
+            if already_claimed_until:
+                already_claimed_embed = discord.Embed(
+                    title="⏰ Rewards Already Claimed",
+                    description="You've already claimed your vote rewards! Please wait before voting again.",
+                    color=discord.Color.orange()
+                )
+                time_until_next = already_claimed_until - datetime.now()
+                hours_until_next = max(0, time_until_next.total_seconds() / 3600)
+                already_claimed_embed.add_field(
+                    name="Next Vote Available",
+                    value=f"You can vote again in **{hours_until_next:.1f} hours**.",
+                    inline=False
+                )
+                await user.send(embed=already_claimed_embed)
+                return
+
+            votecount = reward_result["votecount"]
+            votestreak = reward_result["votestreak"]
+            quest_completed = reward_result["quest_completed"]
+
+            success_embed = discord.Embed(
+                title="🎉 Vote Successful!",
+                description="Thank you for supporting Solo Leveling Bot!",
+                color=discord.Color.green()
+            )
+            success_embed.add_field(
+                name="Rewards Received",
+                value=f"• 1x <:reroll:1302672409278545940>\n• +20 <:candy:1426599572012269578>\n• Vote count: **{votecount}**\n• Vote streak: **{votestreak}** 🔥",
+                inline=False
+            )
+            if quest_completed:
+                success_embed.add_field(
+                    name="🎯 Quest Completed!",
+                    value="You've completed the **'Vote 1 time'** quest and received your rewards!",
+                    inline=False
+                )
+            if votestreak >= 7:
+                success_embed.add_field(
+                    name="🔥 Streak Bonus!",
+                    value=f"Amazing! You've voted **{votestreak}** days in a row! Keep it up!",
+                    inline=False
+                )
+            success_embed.add_field(
+                name="Next Vote",
+                value="You can vote again in **12 hours**!",
+                inline=False
+            )
+            if user.avatar:
+                success_embed.set_thumbnail(url=user.avatar.url)
+            success_embed.set_footer(text="Thank you for your support! ❤️")
+            success_embed.timestamp = datetime.now()
+            await user.send(embed=success_embed)
+            print(f"Successfully processed vote and sent DM to user {user_id}")
+            return
+
             # Get user from database
             query = "SELECT user_id, votecount, votestreak, vote_timer FROM user WHERE user_authorid = %s"
             result = await execute_query_with_retry(query, (str(user_id),))

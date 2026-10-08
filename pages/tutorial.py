@@ -14,6 +14,7 @@ from datetime import datetime
 import json
 import time
 from utils.database import execute_query_with_retry, get_metrics
+from utils.db_atomic import db_advisory_lock, db_transaction
 
 import functools
 
@@ -95,6 +96,195 @@ ch.setFormatter(formatter)
 
 logger.addHandler(fh)
 logger.addHandler(ch)
+
+
+async def _add_inventory_quantity(table_name: str, id_column: str, inventory_id: int, item_id: int, quantity: int):
+    rows = await execute_query_with_retry(
+        f"""
+        SELECT quantiter
+        FROM {table_name}
+        WHERE inventory_id = %s AND {id_column} = %s
+        FOR UPDATE
+        """,
+        (inventory_id, item_id)
+    )
+    if rows:
+        await execute_query_with_retry(
+            f"""
+            UPDATE {table_name}
+            SET quantiter = quantiter + %s
+            WHERE inventory_id = %s AND {id_column} = %s
+            """,
+            (quantity, inventory_id, item_id)
+        )
+    else:
+        await execute_query_with_retry(
+            f"""
+            INSERT INTO {table_name} (inventory_id, {id_column}, quantiter)
+            VALUES (%s, %s, %s)
+            """,
+            (inventory_id, item_id, quantity)
+        )
+
+
+async def _apply_tutorial_reward_rows(user_id: int, inventory_id: Optional[int], rewards: list[dict]):
+    for reward in rewards:
+        if reward.get('won_reward') and reward.get('won_reward') != 0:
+            await execute_query_with_retry(
+                "UPDATE user SET won_currency = won_currency + %s WHERE user_id = %s",
+                (reward.get('won_quantity', 0), user_id)
+            )
+
+        if reward.get('gwon_reward') and reward.get('gwon_reward') != 0:
+            await execute_query_with_retry(
+                "UPDATE user SET gamble_currency = gamble_currency + %s WHERE user_id = %s",
+                (reward.get('gwon_quantity', 0), user_id)
+            )
+
+        if inventory_id is None:
+            continue
+
+        if reward.get('product_id') and reward.get('product_id') != 0:
+            await _add_inventory_quantity(
+                "inventory_product", "product_id", inventory_id,
+                reward.get('product_id'), reward.get('product_quantity', 0)
+            )
+
+        if reward.get('dungeonkey_id') and reward.get('dungeonkey_id') != 0:
+            await _add_inventory_quantity(
+                "inventory_dungeonkey", "dungeonkey_id", inventory_id,
+                reward.get('dungeonkey_id'), reward.get('dungeonkey_quantity', 0)
+            )
+
+        if reward.get('chest_id') and reward.get('chest_id') != 0:
+            await _add_inventory_quantity(
+                "inventory_chest", "chest_id", inventory_id,
+                reward.get('chest_id'), reward.get('chest_quantity', 0)
+            )
+
+        if reward.get('pickaxe_id') and reward.get('pickaxe_id') != 0:
+            await _add_inventory_quantity(
+                "inventory_pickaxe", "id_pickaxe", inventory_id,
+                reward.get('pickaxe_id'), reward.get('pickaxe_quantity', 0)
+            )
+
+        if reward.get('orb_id') and reward.get('orb_id') != 0:
+            await _add_inventory_quantity(
+                "inventory_orbs", "orb_id", inventory_id,
+                reward.get('orb_id'), reward.get('orb_quantity', 0)
+            )
+
+        if reward.get('skill_id') and reward.get('skill_id') != 0:
+            await _add_inventory_quantity(
+                "inventory_skills", "skill_id", inventory_id,
+                reward.get('skill_id'), reward.get('skill_quantity', 0)
+            )
+
+
+async def complete_tutorial_rewards_atomic(user_id: int, subtutorial_id: int):
+    async with db_advisory_lock(f"slbot:tutorial:{user_id}:{subtutorial_id}", timeout=5):
+        async with db_transaction():
+            completed = await execute_query_with_retry(
+                """
+                SELECT 1
+                FROM user_tutorials
+                WHERE user_id = %s AND subtutorial_id = %s
+                FOR UPDATE
+                """,
+                (user_id, subtutorial_id)
+            )
+            if completed:
+                await execute_query_with_retry(
+                    "DELETE FROM quiz_status WHERE user_id = %s AND subtutorial_id = %s",
+                    (user_id, subtutorial_id)
+                )
+                return {"status": "already_completed"}
+
+            if subtutorial_id == 14:
+                skills = await execute_query_with_retry(
+                    """
+                    SELECT DISTINCT tr.skill_id, s.skill_name
+                    FROM tutorial_rewards tr
+                    JOIN skill s ON tr.skill_id = s.skill_id
+                    WHERE tr.subtutorial_id = %s AND tr.skill_id != 0
+                    """,
+                    (subtutorial_id,)
+                )
+                if skills and len(skills) > 1:
+                    return {"status": "skill_selection", "skills": skills}
+
+            await execute_query_with_retry(
+                "INSERT INTO user_tutorials (user_id, subtutorial_id) VALUES (%s, %s)",
+                (user_id, subtutorial_id)
+            )
+
+            rewards = await execute_query_with_retry(
+                "SELECT * FROM tutorial_rewards WHERE subtutorial_id = %s",
+                (subtutorial_id,)
+            )
+            if rewards:
+                inventory_rows = await execute_query_with_retry(
+                    "SELECT inventory_id FROM inventory WHERE user_id = %s FOR UPDATE",
+                    (user_id,)
+                )
+                inventory_id = inventory_rows[0]['inventory_id'] if inventory_rows else None
+                await _apply_tutorial_reward_rows(user_id, inventory_id, rewards)
+
+            await execute_query_with_retry(
+                "DELETE FROM quiz_status WHERE user_id = %s AND subtutorial_id = %s",
+                (user_id, subtutorial_id)
+            )
+            return {"status": "completed"}
+
+
+async def select_tutorial_skill_atomic(user_id: int, subtutorial_id: int, skill_id: int):
+    async with db_advisory_lock(f"slbot:tutorial:{user_id}:{subtutorial_id}", timeout=5):
+        async with db_transaction():
+            completed = await execute_query_with_retry(
+                """
+                SELECT 1
+                FROM user_tutorials
+                WHERE user_id = %s AND subtutorial_id = %s
+                FOR UPDATE
+                """,
+                (user_id, subtutorial_id)
+            )
+            if completed:
+                await execute_query_with_retry(
+                    "DELETE FROM quiz_status WHERE user_id = %s AND subtutorial_id = %s",
+                    (user_id, subtutorial_id)
+                )
+                return {"status": "already_completed"}
+
+            inventory_rows = await execute_query_with_retry(
+                "SELECT inventory_id FROM inventory WHERE user_id = %s FOR UPDATE",
+                (user_id,)
+            )
+            if not inventory_rows:
+                return {"status": "inventory_missing"}
+
+            reward_rows = await execute_query_with_retry(
+                """
+                SELECT skill_quantity
+                FROM tutorial_rewards
+                WHERE subtutorial_id = %s AND skill_id = %s
+                """,
+                (subtutorial_id, skill_id)
+            )
+            skill_quantity = reward_rows[0]['skill_quantity'] if reward_rows else 1
+
+            await execute_query_with_retry(
+                "INSERT INTO user_tutorials (user_id, subtutorial_id) VALUES (%s, %s)",
+                (user_id, subtutorial_id)
+            )
+            await _add_inventory_quantity(
+                "inventory_skills", "skill_id", inventory_rows[0]['inventory_id'], skill_id, skill_quantity
+            )
+            await execute_query_with_retry(
+                "DELETE FROM quiz_status WHERE user_id = %s AND subtutorial_id = %s",
+                (user_id, subtutorial_id)
+            )
+            return {"status": "completed", "quantity": skill_quantity}
 
 class TutorialNavigationView(View):
     def __init__(self, tutorials: List[Dict], current_index: int, lang: int, user_id: int, user_authorid: int):
@@ -626,10 +816,7 @@ class SkillSelectionView(View):
                 if interaction.user.id != self.user_authorid:
                     await interaction.response.send_message("You cannot use this button.", ephemeral=True)
                     return
-                print("infos")
-                print(sid)
-                print(sname)
-                
+
                 await self.select_skill(interaction, sid, sname)
             
             button = discord.ui.Button(label=skill_name[:80], style=discord.ButtonStyle.primary)
@@ -639,40 +826,17 @@ class SkillSelectionView(View):
     async def select_skill(self, interaction: discord.Interaction, skill_id: int, skill_name: str):
         """Handle skill selection and distribute only that skill"""
         try:
-            # Get inventory_id
-            q = "SELECT inventory_id FROM inventory WHERE user_id = %s"
-            inv_res = await execute_query_with_retry(q, (self.user_id,))
-            if not inv_res:
+            result = await select_tutorial_skill_atomic(self.user_id, self.quiz_view.subtutorial_id, skill_id)
+            if result["status"] == "inventory_missing":
                 await interaction.response.send_message("Error: Inventory not found.", ephemeral=True)
                 return
-            
-            inventory_id = inv_res[0]['inventory_id']
-            
-            # Get skill quantity from rewards
-            q = """SELECT skill_quantity FROM tutorial_rewards 
-                   WHERE subtutorial_id = %s AND skill_id = %s"""
-            reward_res = await execute_query_with_retry(q, (self.quiz_view.subtutorial_id, skill_id))
-            skill_quantity = reward_res[0]['skill_quantity'] if reward_res else 1
-            print(skill_quantity)
-            print("get")
-            # Add skill to inventory
-            q = """SELECT * FROM inventory_skills 
-                   WHERE inventory_id = %s AND skill_id = %s"""
-            skill_inv_res = await execute_query_with_retry(q, (inventory_id, skill_id))
-            print(q)
-            if skill_inv_res:
-                q = """UPDATE inventory_skills SET quantiter = quantiter + %s 
-                       WHERE inventory_id = %s AND skill_id = %s"""
-                await execute_query_with_retry(q, (skill_quantity, inventory_id, skill_id))
-            else:
-                q = """INSERT INTO inventory_skills (inventory_id, skill_id, quantiter) 
-                       VALUES (%s, %s, %s)"""
-                await execute_query_with_retry(q, (inventory_id, skill_id, skill_quantity))
-            
-            # Delete quiz_status
-            q = """DELETE FROM quiz_status 
-                   WHERE user_id = %s AND subtutorial_id = %s"""
-            await execute_query_with_retry(q, (self.user_id, self.quiz_view.subtutorial_id))
+
+            if result["status"] == "already_completed":
+                self.quiz_view.already_completed = True
+                await interaction.response.send_message("You already completed this quest before.", ephemeral=True)
+                return
+
+            skill_quantity = result["quantity"]
             
             # Show success message
             embed = discord.Embed(
@@ -703,6 +867,15 @@ class SkillSelectionView(View):
         except Exception as e:
             logger.error(f"Error selecting skill: {e}")
             await interaction.response.send_message("Error processing skill selection.", ephemeral=True)
+
+    async def on_timeout(self):
+        try:
+            await execute_query_with_retry(
+                "DELETE FROM quiz_status WHERE user_id = %s AND subtutorial_id = %s",
+                (self.user_id, self.quiz_view.subtutorial_id)
+            )
+        except Exception as e:
+            logger.error(f"Error cleaning up skill selection quiz_status on timeout: {e}")
 
 class QuestionAnswerView(View):
     def __init__(self, quiz_view: QuizNavigationView, user_id: int, user_authorid: int):
@@ -900,175 +1073,23 @@ class QuestionAnswerView(View):
             logger.error(f"Error cleaning up quiz_status on timeout: {e}")                
     async def distribute_rewards(self):
         try:
-            q = """SELECT * FROM user_tutorials 
-                   WHERE user_id = %s AND subtutorial_id = %s"""
-            res = await execute_query_with_retry(q, (self.user_id, self.quiz_view.subtutorial_id))
-            
-            if res:
-                # Already completed, set flag and delete quiz_status
+            result = await complete_tutorial_rewards_atomic(self.user_id, self.quiz_view.subtutorial_id)
+
+            if result["status"] == "already_completed":
                 self.quiz_view.already_completed = True
-                q = """DELETE FROM quiz_status 
-                       WHERE user_id = %s AND subtutorial_id = %s"""
-                await execute_query_with_retry(q, (self.user_id, self.quiz_view.subtutorial_id))
                 return None
-            
-            if self.quiz_view.subtutorial_id == 14:
-                q = """SELECT DISTINCT tr.skill_id, s.skill_name FROM tutorial_rewards tr
-                       JOIN skill s ON tr.skill_id = s.skill_id
-                       WHERE tr.subtutorial_id = %s AND tr.skill_id != 0"""
-                skills_res = await execute_query_with_retry(q, (self.quiz_view.subtutorial_id,))
-                
-                if skills_res and len(skills_res) > 1:
-                    # Multiple skills - show selection view and return it
-                    skill_selection_view = SkillSelectionView(self.quiz_view, self.user_id, self.user_authorid, skills_res)
-                    embed = discord.Embed(
-                        title=_tr(self.quiz_view.lang, "Choose Your Skill", "اختر مهارتك", "Choisissez Votre Compétence"),
-                        description=_tr(self.quiz_view.lang, "Select which skill you want to receive:", "اختر المهارة التي تريد الحصول عليها:", "Sélectionnez la compétence que vous souhaitez recevoir:"),
-                        color=discord.Color.blue()
-                    )
-                    
-                    # Insert into user_tutorials now (before skill selection)
-                    q = """INSERT INTO user_tutorials (user_id, subtutorial_id) 
-                           VALUES (%s, %s)"""
-                    await execute_query_with_retry(q, (self.user_id, self.quiz_view.subtutorial_id))
-                    
-                    # Delete quiz_status
-                    q = """DELETE FROM quiz_status 
-                           WHERE user_id = %s AND subtutorial_id = %s"""
-                    await execute_query_with_retry(q, (self.user_id, self.quiz_view.subtutorial_id))
-                    
-                    # Return tuple so check_answer knows to display skill selection
-                    return (embed, skill_selection_view)
-            
-            # Normal reward distribution
-            q = """INSERT INTO user_tutorials (user_id, subtutorial_id) 
-                   VALUES (%s, %s)"""
-            await execute_query_with_retry(q, (self.user_id, self.quiz_view.subtutorial_id))
-            
-            q = """SELECT * FROM tutorial_rewards WHERE subtutorial_id = %s"""
-            rewards = await execute_query_with_retry(q, (self.quiz_view.subtutorial_id,))
-            
-            if not rewards:
-                q = """DELETE FROM quiz_status 
-                       WHERE user_id = %s AND subtutorial_id = %s"""
-                await execute_query_with_retry(q, (self.user_id, self.quiz_view.subtutorial_id))
-                return None
-            
-            for reward in rewards:
-                # Update won currency
-                if reward.get('won_reward') and reward.get('won_reward') != 0:
-                    q = """UPDATE user SET won_currency = won_currency + %s 
-                           WHERE user_id = %s"""
-                    await execute_query_with_retry(q, (reward.get('won_quantity', 0), self.user_id))
-                
-                # Update gamble currency
-                if reward.get('gwon_reward') and reward.get('gwon_reward') != 0:
-                    q = """UPDATE user SET gamble_currency = gamble_currency + %s 
-                           WHERE user_id = %s"""
-                    await execute_query_with_retry(q, (reward.get('gwon_quantity', 0), self.user_id))
-                
-                # Get inventory_id
-                q = "SELECT inventory_id FROM inventory WHERE user_id = %s"
-                inv_res = await execute_query_with_retry(q, (self.user_id,))
-                if not inv_res:
-                    continue
-                
-                inventory_id = inv_res[0]['inventory_id']
-                
-                # Handle products
-                if reward.get('product_id') and reward.get('product_id') != 0:
-                    q = """SELECT * FROM inventory_product 
-                           WHERE inventory_id = %s AND product_id = %s"""
-                    prod_res = await execute_query_with_retry(q, (inventory_id, reward.get('product_id')))
-                    
-                    if prod_res:
-                        q = """UPDATE inventory_product SET quantiter = quantiter + %s 
-                               WHERE inventory_id = %s AND product_id = %s"""
-                        await execute_query_with_retry(q, (reward.get('product_quantity', 0), inventory_id, reward.get('product_id')))
-                    else:
-                        q = """INSERT INTO inventory_product (inventory_id, product_id, quantiter) 
-                               VALUES (%s, %s, %s)"""
-                        await execute_query_with_retry(q, (inventory_id, reward.get('product_id'), reward.get('product_quantity', 0)))
-                
-                # Handle dungeon keys
-                if reward.get('dungeonkey_id') and reward.get('dungeonkey_id') != 0:
-                    q = """SELECT * FROM inventory_dungeonkey 
-                           WHERE inventory_id = %s AND dungeonkey_id = %s"""
-                    key_res = await execute_query_with_retry(q, (inventory_id, reward.get('dungeonkey_id')))
-                    
-                    if key_res:
-                        q = """UPDATE inventory_dungeonkey SET quantiter = quantiter + %s 
-                               WHERE inventory_id = %s AND dungeonkey_id = %s"""
-                        await execute_query_with_retry(q, (reward.get('dungeonkey_quantity', 0), inventory_id, reward.get('dungeonkey_id')))
-                    else:
-                        q = """INSERT INTO inventory_dungeonkey (inventory_id, dungeonkey_id, quantiter) 
-                               VALUES (%s, %s, %s)"""
-                        await execute_query_with_retry(q, (inventory_id, reward.get('dungeonkey_id'), reward.get('dungeonkey_quantity', 0)))
-                
-                # Handle chests
-                if reward.get('chest_id') and reward.get('chest_id') != 0:
-                    q = """SELECT * FROM inventory_chest 
-                           WHERE inventory_id = %s AND chest_id = %s"""
-                    chest_res = await execute_query_with_retry(q, (inventory_id, reward.get('chest_id')))
-                    
-                    if chest_res:
-                        q = """UPDATE inventory_chest SET quantiter = quantiter + %s 
-                               WHERE inventory_id = %s AND chest_id = %s"""
-                        await execute_query_with_retry(q, (reward.get('chest_quantity', 0), inventory_id, reward.get('chest_id')))
-                    else:
-                        q = """INSERT INTO inventory_chest (inventory_id, chest_id, quantiter) 
-                               VALUES (%s, %s, %s)"""
-                        await execute_query_with_retry(q, (inventory_id, reward.get('chest_id'), reward.get('chest_quantity', 0)))
-                
-                # Handle pickaxes
-                if reward.get('pickaxe_id') and reward.get('pickaxe_id') != 0:
-                    q = """SELECT * FROM inventory_pickaxe 
-                           WHERE inventory_id = %s AND id_pickaxe = %s"""
-                    pick_res = await execute_query_with_retry(q, (inventory_id, reward.get('pickaxe_id')))
-                    
-                    if pick_res:
-                        q = """UPDATE inventory_pickaxe SET quantiter = quantiter + %s 
-                               WHERE inventory_id = %s AND id_pickaxe = %s"""
-                        await execute_query_with_retry(q, (reward.get('pickaxe_quantity', 0), inventory_id, reward.get('pickaxe_id')))
-                    else:
-                        q = """INSERT INTO inventory_pickaxe (inventory_id, id_pickaxe, quantiter) 
-                               VALUES (%s, %s, %s)"""
-                        await execute_query_with_retry(q, (inventory_id, reward.get('pickaxe_id'), reward.get('pickaxe_quantity', 0)))
-                
-                # Handle orbs
-                if reward.get('orb_id') and reward.get('orb_id') != 0:
-                    q = """SELECT * FROM inventory_orbs 
-                           WHERE inventory_id = %s AND orb_id = %s"""
-                    orb_res = await execute_query_with_retry(q, (inventory_id, reward.get('orb_id')))
-                    
-                    if orb_res:
-                        q = """UPDATE inventory_orbs SET quantiter = quantiter + %s 
-                               WHERE inventory_id = %s AND orb_id = %s"""
-                        await execute_query_with_retry(q, (reward.get('orb_quantity', 0), inventory_id, reward.get('orb_id')))
-                    else:
-                        q = """INSERT INTO inventory_orbs (inventory_id, orb_id, quantiter) 
-                               VALUES (%s, %s, %s)"""
-                        await execute_query_with_retry(q, (inventory_id, reward.get('orb_id'), reward.get('orb_quantity', 0)))
-                
-                # Handle skills
-                if reward.get('skill_id') and reward.get('skill_id') != 0:
-                    q = """SELECT * FROM inventory_skills 
-                           WHERE inventory_id = %s AND skill_id = %s"""
-                    skill_res = await execute_query_with_retry(q, (inventory_id, reward.get('skill_id')))
-                    
-                    if skill_res:
-                        q = """UPDATE inventory_skills SET quantiter = quantiter + %s 
-                               WHERE inventory_id = %s AND skill_id = %s"""
-                        await execute_query_with_retry(q, (reward.get('skill_quantity', 0), inventory_id, reward.get('skill_id')))
-                    else:
-                        q = """INSERT INTO inventory_skills (inventory_id, skill_id, quantiter) 
-                               VALUES (%s, %s, %s)"""
-                        await execute_query_with_retry(q, (inventory_id, reward.get('skill_id'), reward.get('skill_quantity', 0)))
-            
-            q = """DELETE FROM quiz_status 
-                   WHERE user_id = %s AND subtutorial_id = %s"""
-            await execute_query_with_retry(q, (self.user_id, self.quiz_view.subtutorial_id))
-        
+
+            if result["status"] == "skill_selection":
+                skill_selection_view = SkillSelectionView(self.quiz_view, self.user_id, self.user_authorid, result["skills"])
+                embed = discord.Embed(
+                    title=_tr(self.quiz_view.lang, "Choose Your Skill", "اختر مهارتك", "Choisissez Votre Compétence"),
+                    description=_tr(self.quiz_view.lang, "Select which skill you want to receive:", "اختر المهارة التي تريد الحصول عليها:", "Sélectionnez la compétence que vous souhaitez recevoir:"),
+                    color=discord.Color.blue()
+                )
+                return (embed, skill_selection_view)
+
+            return None
+
         except Exception as e:
             logger.error(f"Error distributing rewards: {e}")
 

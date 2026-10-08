@@ -7,6 +7,7 @@ import time
 import functools
 from typing import List, Dict, Union
 from utils.database import execute_query_with_retry, get_metrics
+from utils.db_atomic import advisory_lock_for_context, db_transaction
 
 # ---------------------------
 # Simple translation helpers
@@ -369,6 +370,7 @@ class DailyCommands(commands.Cog):
             return False
 
     @commands.command(name="daily", aliases=["dl", "dy"])
+    @advisory_lock_for_context("slbot:daily")
     async def daily(self, ctx):
         try:
             lang = await _get_lang_from_discord_id(ctx.author.id)
@@ -430,7 +432,6 @@ class DailyCommands(commands.Cog):
                     return
 
             new_streak = streak + 1 if last_daily and current_time - last_daily < timedelta(hours=48) else 1
-            await self.update_daily_info(user_id, current_time, new_streak)
 
             # Get rewards
             won = self.get_won(new_streak)
@@ -447,23 +448,30 @@ class DailyCommands(commands.Cog):
             booster_bonus = False
 
             if is_booster:
-                # Add roll reset to inventory
-                await self.add_roll_reset_to_inventory(inventory_id)
-
                 # Add bonus currency
                 won += 10000
                 gwon += 5000
                 booster_bonus = True
 
-            # Add regular chests to inventory
-            for chest_id, quantity in chest_rewards:
-                await self.add_chest_to_inventory(inventory_id, chest_id, quantity)
+            async with db_transaction():
+                await self.update_daily_info(user_id, current_time, new_streak)
 
-            # Add prenium chest if applicable
-            if current_prenium > 0:
-                await self.add_prenium_chest(inventory_id, current_prenium)
+                if is_booster:
+                    # Add roll reset to inventory
+                    await self.add_roll_reset_to_inventory(inventory_id)
 
-            await self.update_currency(user_id, won, gwon)
+                # Add regular chests to inventory
+                for chest_id, quantity in chest_rewards:
+                    await self.add_chest_to_inventory(inventory_id, chest_id, quantity)
+
+                # Add prenium chest if applicable
+                if current_prenium > 0:
+                    await self.add_prenium_chest(inventory_id, current_prenium)
+
+                await self.update_currency(user_id, won, gwon)
+
+                if new_streak == 7:
+                    await self.update_daily_info(user_id, current_time, 0)
 
             # Create embed
             embed = discord.Embed(color=0x1a1a1a)
@@ -535,9 +543,6 @@ class DailyCommands(commands.Cog):
             embed.set_footer(text=footer_text)
 
             await ctx.reply(embed=embed)
-
-            if new_streak == 7:
-                await self.update_daily_info(user_id, current_time, 0)
 
         except Exception as e:
             print(f"Error in daily command: {e}")

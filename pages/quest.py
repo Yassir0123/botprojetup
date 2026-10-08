@@ -8,6 +8,7 @@ import asyncio
 from typing import List, Dict, Union
 from enum import Enum
 from utils.database import execute_query_with_retry, get_metrics
+from utils.db_atomic import advisory_lock_for_context, db_transaction
 import functools
 
 # ---------------------------
@@ -115,6 +116,7 @@ class QuestCommands(commands.Cog):
         self.REQUIRED_QUEST_COUNT = 5
 
     @commands.command(name="quest")
+    @advisory_lock_for_context("slbot:quest")
     async def quest(self, ctx):
         lang = await get_user_multilanguage(ctx.author.id)
         discord_id = str(ctx.author.id)
@@ -262,30 +264,38 @@ class QuestCommands(commands.Cog):
             inventory_id = inventory[0]['inventory_id']
             shadow_chest_product_ids = [2, 3]  # example
 
-            for product_id in shadow_chest_product_ids:
-                existing_product = await execute_query_with_retry(
-                    "SELECT 1 FROM inventory_product WHERE inventory_id = %s AND product_id = %s",
-                    (inventory_id, product_id)
+            async with db_transaction():
+                status_rows = await execute_query_with_retry(
+                    "SELECT quest_status FROM user WHERE user_id = %s FOR UPDATE",
+                    (user_id,)
                 )
-                if existing_product:
-                    await execute_query_with_retry(
-                        "UPDATE inventory_product SET quantiter = quantiter + 1 WHERE inventory_id = %s AND product_id = %s",
-                        (inventory_id, product_id)
-                    )
-                else:
-                    await execute_query_with_retry(
-                        "INSERT INTO inventory_product (inventory_id, product_id, quantiter) VALUES (%s, %s, 1)",
-                        (inventory_id, product_id)
-                    )
+                if status_rows and status_rows[0]['quest_status'] == QuestStatus.COMPLETE.value:
+                    return
 
-            await execute_query_with_retry(
-                "UPDATE user SET quest_status = %s WHERE user_id = %s",
-                (QuestStatus.COMPLETE.value, user_id)
-            )
-            await execute_query_with_retry(
-                "UPDATE user_quests SET completion_status = %s WHERE user_id = %s",
-                (QuestStatus.COMPLETE.value, user_id)
-            )
+                for product_id in shadow_chest_product_ids:
+                    existing_product = await execute_query_with_retry(
+                        "SELECT 1 FROM inventory_product WHERE inventory_id = %s AND product_id = %s FOR UPDATE",
+                        (inventory_id, product_id)
+                    )
+                    if existing_product:
+                        await execute_query_with_retry(
+                            "UPDATE inventory_product SET quantiter = quantiter + 1 WHERE inventory_id = %s AND product_id = %s",
+                            (inventory_id, product_id)
+                        )
+                    else:
+                        await execute_query_with_retry(
+                            "INSERT INTO inventory_product (inventory_id, product_id, quantiter) VALUES (%s, %s, 1)",
+                            (inventory_id, product_id)
+                        )
+
+                await execute_query_with_retry(
+                    "UPDATE user SET quest_status = %s WHERE user_id = %s",
+                    (QuestStatus.COMPLETE.value, user_id)
+                )
+                await execute_query_with_retry(
+                    "UPDATE user_quests SET completion_status = %s WHERE user_id = %s",
+                    (QuestStatus.COMPLETE.value, user_id)
+                )
 
             embed = discord.Embed(
                 title=_tr(lang, "Daily Quests Completed!", "تم إكمال المهام اليومية!", "Quêtes quotidiennes terminées !"),
@@ -479,61 +489,61 @@ class QuestCommands(commands.Cog):
     async def reset_quests(self, user_id: int, current_time: datetime):
         try:
             print(f"Resetting quests for user {user_id} at {current_time}")
-            
-            await execute_query_with_retry(
-                """
-                UPDATE user 
-                SET quest_status = %s, 
-                    quest_daily = %s 
-                WHERE user_id = %s
-                """,
-                (QuestStatus.INCOMPLETE.value, current_time, user_id)
-            )
 
-            await execute_query_with_retry("DELETE FROM user_quests WHERE user_id = %s", (user_id,))
-
-            all_quests = await execute_query_with_retry("SELECT quest_id, required_count FROM quest")
-            
-            quest_12_exists = False
-            quest_12_data = None
-            for quest in all_quests:
-                if quest['quest_id'] == 12:
-                    quest_12_exists = True
-                    quest_12_data = quest
-                    break
-            
-            selected_quest_ids = set()
-            selected_quests = []
-            if quest_12_exists:
-                selected_quest_ids.add(12)
-                selected_quests.append(quest_12_data)
-                print(f"Added required quest_id 12 to user {user_id}'s quests")
-            
-            other_quests = [q for q in all_quests if q['quest_id'] != 12]
-            random.shuffle(other_quests)
-            
-            remaining_slots = self.REQUIRED_QUEST_COUNT - len(selected_quests)
-            for quest in other_quests:
-                quest_id = quest['quest_id']
-                if quest_id not in selected_quest_ids and len(selected_quests) < self.REQUIRED_QUEST_COUNT:
-                    selected_quest_ids.add(quest_id)
-                    selected_quests.append(quest)
-                if len(selected_quests) >= self.REQUIRED_QUEST_COUNT:
-                    break
-            
-            print(f"Selected {len(selected_quests)} unique quests for user {user_id}")
-            
-            for quest in selected_quests:
+            async with db_transaction():
                 await execute_query_with_retry(
                     """
-                    INSERT INTO user_quests 
-                    (user_id, quest_id, current_count, completion_status) 
-                    VALUES (%s, %s, 0, %s)
+                    UPDATE user
+                    SET quest_status = %s,
+                        quest_daily = %s
+                    WHERE user_id = %s
                     """,
-                    (user_id, quest['quest_id'], QuestStatus.INCOMPLETE.value)
+                    (QuestStatus.INCOMPLETE.value, current_time, user_id)
                 )
-                
-            await self.validate_quest_count(user_id)
+
+                await execute_query_with_retry("DELETE FROM user_quests WHERE user_id = %s", (user_id,))
+
+                all_quests = await execute_query_with_retry("SELECT quest_id, required_count FROM quest")
+
+                quest_12_exists = False
+                quest_12_data = None
+                for quest in all_quests:
+                    if quest['quest_id'] == 12:
+                        quest_12_exists = True
+                        quest_12_data = quest
+                        break
+
+                selected_quest_ids = set()
+                selected_quests = []
+                if quest_12_exists:
+                    selected_quest_ids.add(12)
+                    selected_quests.append(quest_12_data)
+                    print(f"Added required quest_id 12 to user {user_id}'s quests")
+
+                other_quests = [q for q in all_quests if q['quest_id'] != 12]
+                random.shuffle(other_quests)
+
+                for quest in other_quests:
+                    quest_id = quest['quest_id']
+                    if quest_id not in selected_quest_ids and len(selected_quests) < self.REQUIRED_QUEST_COUNT:
+                        selected_quest_ids.add(quest_id)
+                        selected_quests.append(quest)
+                    if len(selected_quests) >= self.REQUIRED_QUEST_COUNT:
+                        break
+
+                print(f"Selected {len(selected_quests)} unique quests for user {user_id}")
+
+                for quest in selected_quests:
+                    await execute_query_with_retry(
+                        """
+                        INSERT INTO user_quests
+                        (user_id, quest_id, current_count, completion_status)
+                        VALUES (%s, %s, 0, %s)
+                        """,
+                        (user_id, quest['quest_id'], QuestStatus.INCOMPLETE.value)
+                    )
+
+                await self.validate_quest_count(user_id)
                 
         except Exception as e:
             print(f"Error resetting quests: {e}")
